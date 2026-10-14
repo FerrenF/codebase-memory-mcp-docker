@@ -1,0 +1,37 @@
+#!/bin/sh
+# stdio MCP entry point for clients on the host.
+#
+# Point your MCP client's "command" at this script. It runs a
+# codebase-memory-mcp frontend inside the running container, in the same
+# directory the client launched it from (the server roots a session in its
+# working directory). That directory must be inside a host path the container
+# bind-mounts (CBM_WORKSPACE), which compose mounts at the identical path.
+#
+# Override the container name with CBM_CONTAINER if you changed it.
+set -eu
+
+container="${CBM_CONTAINER:-codebase-memory-mcp}"
+die() { echo "cbm-mcp: $*" >&2; exit 1; }
+
+# One inspect call: running state on line 1, bind-mount targets after it.
+info=$(docker container inspect -f \
+    '{{.State.Running}}{{range .Mounts}}{{if eq .Type "bind"}}{{"\n"}}{{.Destination}}{{end}}{{end}}' \
+    "$container" 2>/dev/null) || die "no container '$container'; start it with 'docker compose -f <repo>/docker/compose.yaml up -d'"
+
+[ "$(printf '%s\n' "$info" | head -n1)" = true ] \
+    || die "container '$container' is not running; start it with 'docker compose -f <repo>/docker/compose.yaml up -d'"
+
+# Refuse to start outside the mounted workspace: the path would either not
+# exist in the container or, worse, exist as an unrelated container directory
+# (/tmp, /home, ...) and silently index the wrong thing.
+inside=false
+while IFS= read -r mount; do
+    [ -n "$mount" ] || continue
+    case "$PWD/" in "${mount%/}/"*) inside=true; break ;; esac
+done <<EOF
+$(printf '%s\n' "$info" | tail -n +2)
+EOF
+$inside || die "$PWD is not inside a directory mounted into '$container' (see CBM_WORKSPACE in docker/.env)"
+
+# -i keeps stdin attached for JSON-RPC; no -t, which would corrupt the stream.
+exec docker exec -i -w "$PWD" "$container" codebase-memory-mcp "$@"
