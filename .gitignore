@@ -96,3 +96,5 @@ soak-results-query-leak/
 
 # Configured environmental variable settings for the compose setup.
 .env
+# Generated proxy certs. This is done in the image when built.
+certs/*

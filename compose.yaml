@@ -47,6 +47,25 @@ services:
       retries: 3
 
     stop_grace_period: 30s
+  ui-proxy:
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
+      args:
+        PROXY_CERT_SANS: ${PROXY_CERT_SANS:-192.168.1.129}
+        PROXY_CERT_CN: ${PROXY_CERT_CN:-cbm.lan}
+    restart: unless-stopped
+    depends_on: [cbm]
+    environment:
+      PROXY_CERT_CN: cbm.lan                # domains for this service
+      PROXY_CERT_SANS: "DNS:${PROXY_CERT_CN},IP:${PROXY_CERT_SANS}"     # every name/IP for this service. If you set a domain above then you will need to add it here.
+      # PROXY_CERT_DAYS: 825
+    ports:
+      - "0.0.0.0:8443:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./htpasswd:/etc/nginx/htpasswd:ro
+      - ./certs:/etc/nginx/certs                          # no :ro now — it writes here
 
 volumes:
   cbm-data:
