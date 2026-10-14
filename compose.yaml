@@ -18,7 +18,7 @@ services:
       args:
         CBM_VERSION: ${CBM_VERSION:-}
         BUILD_JOBS: ${CBM_BUILD_JOBS:-0}
-    image: codebase-memory-mcp:${CBM_VERSION:-latest}
+    image: ferrenf/codebase-memory-mcp:latest
     
     # The cbm-mcp wrapper execs into this exact name.
     container_name: codebase-memory-mcp
