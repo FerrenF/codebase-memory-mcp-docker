@@ -64,7 +64,7 @@ services:
       - "0.0.0.0:8443:8443"
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./htpasswd:/etc/nginx/htpasswd:ro
+      #- ./htpasswd:/etc/nginx/htpasswd:ro                # If you are using authentication
       - ./certs:/etc/nginx/certs                          # no :ro now — it writes here
 
 volumes:
