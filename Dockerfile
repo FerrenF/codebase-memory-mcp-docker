@@ -38,6 +38,23 @@ ARG BUILD_JOBS=0
 ENV ONNXRUNTIME_NODE_INSTALL=skip \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
+
+    # Streamable-HTTP bridge.
+ARG MCP_PROXY_VERSION=0.13.0
+
+
+
+# Install Python and the venv module
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+    
+RUN python3 -m venv /opt/mcp-proxy \
+    && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
+    && /opt/mcp-proxy/bin/mcp-proxy --version
+
+
 # The npm cache mount keeps repeat UI builds fast without baking it into a layer.
 RUN --mount=type=cache,target=/root/.npm \
     set -eux; \
@@ -52,17 +69,9 @@ RUN --mount=type=cache,target=/root/.npm \
 # streamable http server
 
 
-# Streamable-HTTP bridge.
-ARG MCP_PROXY_VERSION=0.13.0
-RUN python3 -m venv /opt/mcp-proxy \
-    && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
-    && /opt/mcp-proxy/bin/mcp-proxy --version
 
-COPY --from=build /out/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
-COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/cbm-entrypoint
- 
 
-# Runtime 
+    # Runtime 
 FROM ${UBUNTU_IMAGE} AS runtime
 
 # Installs:

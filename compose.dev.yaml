@@ -1,0 +1,73 @@
+# codebase-memory-mcp as a container.
+#
+#   cp .env.example .env      
+#   edit CBM_WORKSPACE, CBM_UID/GID
+#   docker compose -f compose.yaml up -d --build
+#   open browser to localhost:9749 to confirm
+
+# MCP clients connect over stdio through cbm-mcp (a `docker exec` wrapper); see README.md.
+# CBM Lens is at http://localhost:${CBM_UI_PORT}.
+
+name: codebase-memory-mcp
+
+services:
+  cbm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CBM_VERSION: ${CBM_VERSION:-}
+        BUILD_JOBS: ${CBM_BUILD_JOBS:-0}
+
+    # Pull the harbor branch isntead.
+    image: ferrenf/codebase-memory-mcp:harbor
+    
+    # The cbm-mcp wrapper execs into this exact name.
+    container_name: codebase-memory-mcp
+    restart: unless-stopped
+
+    # Run as you, so anything CBM writes into your repositories (e.g. the opt-in .codebase-memory/ snapshot) is owned by you, not root.
+    user: "${CBM_UID:-1000}:${CBM_GID:-1000}"
+
+    environment:
+      CBM_UI_PORT: ${CBM_UI_PORT:-9749}
+      # Other CBM_* tuning (CBM_MEM_BUDGET_MB, CBM_WORKERS, CBM_LOG_LEVEL, ...) goes here too. 
+
+    volumes:
+      # Indexes, cache and logs. Survives rebuilds and `down`; `down -v` wipes it.
+      - cbm-data:/data
+      - ${CBM_WORKSPACE:?set CBM_WORKSPACE in .env}:${CBM_WORKSPACE}
+
+    ports:
+      - "${CBM_UI_PORT:-9749}:19749"
+
+    healthcheck:
+      test: ["CMD", "codebase-memory-mcp", "daemon", "status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    stop_grace_period: 30s
+  ui-proxy:
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
+      args:
+        PROXY_CERT_SANS: ${PROXY_CERT_SANS:-192.168.1.129}
+        PROXY_CERT_CN: ${PROXY_CERT_CN:-cbm.lan}
+    restart: unless-stopped
+    depends_on: [cbm]
+    environment:
+      PROXY_CERT_CN: cbm.lan                # domains for this service
+      PROXY_CERT_SANS: "DNS:${PROXY_CERT_CN},IP:${PROXY_CERT_SANS}"     # every name/IP for this service. If you set a domain above then you will need to add it here.
+      # PROXY_CERT_DAYS: 825
+    ports:
+      - "0.0.0.0:8443:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      #- ./htpasswd:/etc/nginx/htpasswd:ro                # If you are using authentication
+      - ./certs:/etc/nginx/certs                          # no :ro now — it writes here
+
+volumes:
+  cbm-data:
