@@ -4,10 +4,13 @@ services:
     environment:
       CBM_HTTP_PORT: ${CBM_HTTP_PORT:-8811}
     networks:
-      - default
+      - cdb_default
       - harbor
  
 networks:
+  cdb_default:
+    external: true
+    name: codebase-memory-mcp_default
   harbor:
     external: true
     name: harbor_harbor-network
