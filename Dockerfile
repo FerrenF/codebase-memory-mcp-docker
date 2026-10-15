@@ -58,8 +58,9 @@ RUN python3 -m venv /opt/mcp-proxy \
     && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
     && /opt/mcp-proxy/bin/mcp-proxy --version
 
-
-
+COPY --from=build /out/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/cbm-entrypoint
+ 
 
 # Runtime 
 FROM ${UBUNTU_IMAGE} AS runtime
