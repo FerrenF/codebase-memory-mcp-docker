@@ -20,7 +20,7 @@ services:
         BUILD_JOBS: ${CBM_BUILD_JOBS:-0}
 
     # Pull the harbor branch isntead.
-    image: ferrenf/codebase-memory-mcp:harbor
+    image: ferrenf/codebase-memory-mcp:harbor:harbor
     
     # The cbm-mcp wrapper execs into this exact name.
     container_name: codebase-memory-mcp
