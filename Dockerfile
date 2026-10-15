@@ -1,6 +1,7 @@
 # codebase-memory-mcp — container image built from source at https://github.com/DeusData/codebase-memory-mcp
 #
 # Stage 1 builds the native binary with CBM Lens (the web UI) embedded.
+# Stage 2 creates an HTTP bridge to communicate over stdio.
 # Stage 2 is a slim runtime: the binary needs no Node.js, no language runtime and no network at run time.
 
 ARG UBUNTU_IMAGE=ubuntu:24.04
@@ -48,8 +49,19 @@ RUN --mount=type=cache,target=/root/.npm \
     CBM_NO_CCACHE=1 scripts/build.sh --with-ui ${CBM_VERSION:+--version "$CBM_VERSION"}; \
     install -Dm755 build/c/codebase-memory-mcp /out/codebase-memory-mcp; \
     /out/codebase-memory-mcp --version
+# streamable http server
 
-# ── runtime ──────────────────────────────────────────────────────────────────
+
+# Streamable-HTTP bridge.
+ARG MCP_PROXY_VERSION=0.13.0
+RUN python3 -m venv /opt/mcp-proxy \
+    && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
+    && /opt/mcp-proxy/bin/mcp-proxy --version
+
+
+
+
+# Runtime 
 FROM ${UBUNTU_IMAGE} AS runtime
 
 # Installs:
