@@ -47,15 +47,6 @@ services:
     networks:
       - cdb_default
       - harbor
- 
-    networks:
-      cdb_default:
-        external: true
-        name: codebase-memory-mcp_default
-      harbor:
-        external: true
-        name: harbor_harbor-network
- 
 
     healthcheck:
       test: ["CMD", "codebase-memory-mcp", "daemon", "status"]
@@ -87,3 +78,11 @@ services:
 
 volumes:
   cbm-data:
+
+  networks:
+    cdb_default:
+      external: true
+      name: codebase-memory-mcp_default
+    harbor:
+      external: true
+      name: harbor_harbor-network
