@@ -36,6 +36,8 @@ services:
       CBM_HTTP_PORT: ${CBM_HTTP_PORT:-8811}
       # Other CBM_* tuning (CBM_MEM_BUDGET_MB, CBM_WORKERS, CBM_LOG_LEVEL, ...) goes here too. 
 
+      CBM_HTTP_CWD: ${CBM_WORKSPACE}
+
     volumes:
       # Indexes, cache and logs. Survives rebuilds and `down`; `down -v` wipes it.
       - cbm-data:/data
@@ -45,7 +47,7 @@ services:
       - "${CBM_UI_PORT:-9749}:19749"
       
     networks:
-      - cdb_default
+      - default
       - harbor
 
     healthcheck:
@@ -69,8 +71,12 @@ services:
       PROXY_CERT_CN: cbm.lan                # domains for this service
       PROXY_CERT_SANS: "DNS:${PROXY_CERT_CN},IP:${PROXY_CERT_SANS}"     # every name/IP for this service. If you set a domain above then you will need to add it here.
       # PROXY_CERT_DAYS: 825
+      PROXY_HOST: ${PROXY_HOST:-}   # required for this profile; checked at startup
+      PROXY_PORT: ${PROXY_PORT:-8443}
+
     ports:
-      - "0.0.0.0:8443:8443"
+      - "${PROXY_BIND:-0.0.0.0}:${PROXY_PORT:-8443}:8443"
+
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
       #- ./htpasswd:/etc/nginx/htpasswd:ro                # If you are using authentication
@@ -80,9 +86,6 @@ volumes:
   cbm-data:
 
 networks:
-  cdb_default:
-    external: true
-    name: codebase-memory-mcp_default
   harbor:
     external: true
     name: harbor_harbor-network

@@ -1,7 +1,9 @@
 #!/bin/sh
 # Container PID-1 payload (runs under tini).
 #
-# codebase-memory-mcp has no foreground daemon mode: `daemon start` detaches a permanent daemon and returns. MCP clients reach that daemon by running `codebase-memory-mcp` (stdio) inside this container via `docker exec`.
+# codebase-memory-mcp has no foreground daemon mode: `daemon start` detaches a
+# permanent daemon and returns. MCP clients reach that daemon by running
+# `codebase-memory-mcp` (stdio) inside this container via `docker exec`.
 #
 # This script keeps the container's lifetime tied to the daemon's:
 #   - starts the permanent daemon (with the CBM Lens UI),
@@ -45,10 +47,24 @@ DAEMON_PID=""
 FWD_PID=""
 HTTP_PID=""
 
-# One long-lived stdio session, shared by every HTTP client. Its workingdirectory is only the session root; tools take explicit repo_path/project.
+# One long-lived stdio session, shared by every HTTP client. Its working
+# directory is only the session root; tools take explicit repo_path/project.
+MCP_PROXY=/opt/mcp-proxy/bin/mcp-proxy
 start_http() {
     [ -n "${CBM_HTTP_PORT:-}" ] || return 0
-    /opt/mcp-proxy/bin/mcp-proxy --host 0.0.0.0 --port "$CBM_HTTP_PORT" \
+    # A missing bridge is a stale image, not a transient fault: say so once
+    # and keep the rest of the container running instead of a restart loop.
+    if ! "$MCP_PROXY" --version >/dev/null 2>&1; then
+        log "CBM_HTTP_PORT is set but $MCP_PROXY does not run: this image predates"
+        log "the HTTP bridge. Rebuild: docker compose -f docker/compose.yaml up -d --build"
+        CBM_HTTP_PORT=""
+        return 0
+    fi
+    if [ ! -d "${CBM_HTTP_CWD:-/}" ]; then
+        log "CBM_HTTP_CWD=${CBM_HTTP_CWD} is not a directory in the container; using /"
+        CBM_HTTP_CWD=/
+    fi
+    "$MCP_PROXY" --host 0.0.0.0 --port "$CBM_HTTP_PORT" \
         --cwd "${CBM_HTTP_CWD:-/}" --pass-environment -- "$BIN" &
     HTTP_PID=$!
     log "MCP over HTTP on :$CBM_HTTP_PORT (/mcp streamable, /sse), session root ${CBM_HTTP_CWD:-/}"
@@ -60,11 +76,14 @@ shutdown() {
     [ -n "$FWD_PID" ] && kill "$FWD_PID" 2>/dev/null || true
     [ -n "$HTTP_PID" ] && kill "$HTTP_PID" 2>/dev/null || true
 
-    # A clean stop lets the daemon flush SQLite and cancel index workers. It refuses while MCP sessions are attached; those die with the container anyway, so terminate them and retry until the deadline.
+    # A clean stop lets the daemon flush SQLite and cancel index workers. It
+    # refuses while MCP sessions are attached; those die with the container
+    # anyway, so terminate them and retry until the deadline.
     deadline=$(( $(date +%s) + CBM_STOP_TIMEOUT ))
     while [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; do
         if ! "$BIN" daemon stop >/dev/null 2>&1; then
-
+            # Frontend sessions are every CBM process except the daemon itself.
+            # (-f: the 19-char name exceeds the kernel's 15-char comm field.)
             for p in $(pgrep -f "$BIN" 2>/dev/null || true); do
                 [ "$p" = "$DAEMON_PID" ] || kill -TERM "$p" 2>/dev/null || true
             done
@@ -93,8 +112,10 @@ if [ -z "$DAEMON_PID" ]; then
     exit 1
 fi
 log "daemon pid $DAEMON_PID; UI forwarded on :$CBM_UI_PUBLISH_PORT -> 127.0.0.1:$CBM_UI_PORT"
-``
-# TCP-level forward: Host/Origin headers pass through untouched, so the UI's DNS-rebinding guard still applies (only localhost:PORT / 127.0.0.1:PORTare accepted — which is why the host-side port must equal CBM_UI_PORT).
+
+# TCP-level forward: Host/Origin headers pass through untouched, so the UI's
+# DNS-rebinding guard still applies (only localhost:PORT / 127.0.0.1:PORT
+# are accepted — which is why the host-side port must equal CBM_UI_PORT).
 socat "TCP-LISTEN:${CBM_UI_PUBLISH_PORT},fork,reuseaddr" "TCP:127.0.0.1:${CBM_UI_PORT}" &
 FWD_PID=$!
 start_http
