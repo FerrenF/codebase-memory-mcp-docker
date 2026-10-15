@@ -31,6 +31,9 @@ services:
 
     environment:
       CBM_UI_PORT: ${CBM_UI_PORT:-9749}
+
+      # The port we are using for http streaming.
+      CBM_HTTP_PORT: ${CBM_HTTP_PORT:-8811}
       # Other CBM_* tuning (CBM_MEM_BUDGET_MB, CBM_WORKERS, CBM_LOG_LEVEL, ...) goes here too. 
 
     volumes:
@@ -40,6 +43,19 @@ services:
 
     ports:
       - "${CBM_UI_PORT:-9749}:19749"
+      
+    networks:
+      - cdb_default
+      - harbor
+ 
+    networks:
+      cdb_default:
+        external: true
+        name: codebase-memory-mcp_default
+      harbor:
+        external: true
+        name: harbor_harbor-network
+ 
 
     healthcheck:
       test: ["CMD", "codebase-memory-mcp", "daemon", "status"]
