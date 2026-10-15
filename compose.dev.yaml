@@ -79,10 +79,10 @@ services:
 volumes:
   cbm-data:
 
-  networks:
-    cdb_default:
-      external: true
-      name: codebase-memory-mcp_default
-    harbor:
-      external: true
-      name: harbor_harbor-network
+networks:
+  cdb_default:
+    external: true
+    name: codebase-memory-mcp_default
+  harbor:
+    external: true
+    name: harbor_harbor-network
