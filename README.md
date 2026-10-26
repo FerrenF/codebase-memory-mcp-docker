@@ -25,7 +25,33 @@ The native C backend exposes 17 MCP tools and supports 45 automatic or condition
 
 > **CBM Lens Beta is new on `main`:** it arrived with [PR #2068](https://github.com/DeusData/codebase-memory-mcp/pull/2068) and is not part of the current v0.11.0 release, whose installer still ships the previous graph UI. To run the interface shown below now, [build from source](#build-from-source).
 
-[Quick start](#quick-start) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Chat with your codebase locally](#chat-with-your-codebase-locally) · [MCP tools](#mcp-tools) · [Build from source](#build-from-source)
+[Quick start](#quick-start) · [Docker & MCP gateway](#run-in-docker-with-docker-mcp-gateway) · [Explore CBM Lens](#cbm-lens-beta-code-visualization-and-source-navigation) · [Chat with your codebase locally](#chat-with-your-codebase-locally) · [MCP tools](#mcp-tools) · [Build from source](#build-from-source)
+
+### Run in Docker with Docker MCP Gateway
+
+Everything Docker-related lives in [`docker/`](docker/), and [`docker/.env`](docker/.env.example) is the only file you edit.
+
+```bash
+cp docker/.env.example docker/.env      # set CBM_WORKSPACE, CBM_UID/GID, PROXY_HOSTS
+docker compose -f docker/compose.yaml up -d --build
+```
+
+This starts two containers:
+
+| Service | Reachable at | Purpose |
+|---------|--------------|---------|
+| `cbm` | `http://localhost:${CBM_HTTP_PORT}/mcp` (default 8811) | MCP over streamable HTTP (`/sse` also served), for gateways and HTTP clients |
+| `cbm` | `http://localhost:${CBM_UI_PORT}` (default 9749) | CBM Lens, from this machine only |
+| `ui-proxy` | `https://<any PROXY_HOSTS entry>:${PROXY_PORT}` (default 8443) | CBM Lens for other machines, behind a self-signed cert generated into `docker/certs/` (optional login: `PROXY_AUTH_USER` / `PROXY_AUTH_PASSWORD`) |
+
+Then register it with [Docker MCP Gateway](https://github.com/docker/mcp-gateway) as a remote server:
+
+```bash
+docker mcp catalog import docker/mcp-catalog.yaml
+docker mcp gateway run --additional-catalog codebase-memory.yaml --servers codebase-memory
+```
+
+The catalog points at `http://localhost:8811/mcp`, which suits a gateway running on the host. If the gateway runs in a container instead, set `GATEWAY_NETWORK` in `docker/.env` to its Docker network, add `-f docker/compose.gateway.yaml` to the `up` command, and change the catalog URL to `http://codebase-memory-mcp:8811/mcp`. Repositories must sit under `CBM_WORKSPACE`, which is mounted at the same path inside the container, so `repo_path` arguments are the paths you see on the host. Stdio clients on the host can use [`cbm-mcp`](cbm-mcp) instead of HTTP.
 
 > **Research:** The [preprint](https://arxiv.org/abs/2603.27277) compares agents across 31 repositories, reporting **10× lower token use** and **2.1× fewer tool calls**, with answer-quality scores of 83% for CBM versus 92% for file-by-file exploration. These backend results are separate from the five-query comparison above and from CBM Lens.
 

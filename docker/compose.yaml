@@ -1,0 +1,76 @@
+# codebase-memory-mcp as a container. All settings live in docker/.env; no other file needs editing.
+#
+#   cp docker/.env.example docker/.env      # then edit it
+#   docker compose -f docker/compose.yaml up -d --build
+#
+# Attaching to an MCP gateway's Docker network as well: add -f docker/compose.gateway.yaml.
+#
+# What runs:
+#   cbm       CBM daemon + CBM Lens on 127.0.0.1:${CBM_UI_PORT}, MCP over HTTP on :${CBM_HTTP_PORT}/mcp (and /sse).
+#             Stdio MCP clients on the host use ../cbm-mcp (a `docker exec` wrapper) instead.
+#   ui-proxy  CBM Lens over HTTPS on ${PROXY_PORT} for the names/IPs in PROXY_HOSTS. Self-signed cert lands in docker/certs/.
+
+name: codebase-memory-mcp
+
+services:
+  cbm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        CBM_VERSION: ${CBM_VERSION:-}
+        BUILD_JOBS: ${CBM_BUILD_JOBS:-0}
+    image: ${CBM_IMAGE:-ferrenf/codebase-memory-mcp:latest}
+
+    # The cbm-mcp wrapper and gateway catalog address this exact name.
+    container_name: codebase-memory-mcp
+    restart: unless-stopped
+
+    # Run as you, so anything CBM writes into your repositories (e.g. the opt-in .codebase-memory/ snapshot) is owned by you, not root.
+    user: "${CBM_UID:-1000}:${CBM_GID:-1000}"
+
+    environment:
+      CBM_UI_PORT: ${CBM_UI_PORT:-9749}
+      CBM_HTTP_PORT: ${CBM_HTTP_PORT:-8811}
+      CBM_HTTP_CWD: ${CBM_WORKSPACE}
+      # Other CBM_* tuning (CBM_MEM_BUDGET_MB, CBM_WORKERS, CBM_LOG_LEVEL, ...) goes here too.
+
+    volumes:
+      # Indexes, cache and logs. Survives rebuilds and `down`; `down -v` wipes it.
+      - cbm-data:/data
+      - ${CBM_WORKSPACE:?set CBM_WORKSPACE in docker/.env}:${CBM_WORKSPACE}
+
+    ports:
+      # The host port must equal CBM_UI_PORT: CBM Lens only accepts Host localhost:CBM_UI_PORT.
+      - "${CBM_UI_BIND:-127.0.0.1}:${CBM_UI_PORT:-9749}:19749"
+      - "${CBM_HTTP_BIND:-127.0.0.1}:${CBM_HTTP_PORT:-8811}:${CBM_HTTP_PORT:-8811}"
+
+    healthcheck:
+      test: ["CMD", "codebase-memory-mcp", "daemon", "status"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+    stop_grace_period: 30s
+
+  ui-proxy:
+    build: proxy
+    image: codebase-memory-mcp-proxy:latest
+    restart: unless-stopped
+    depends_on: [cbm]
+    environment:
+      PROXY_HOSTS: ${PROXY_HOSTS:?set PROXY_HOSTS in docker/.env}
+      PROXY_PORT: ${PROXY_PORT:-8443}
+      PROXY_CERT_DAYS: ${PROXY_CERT_DAYS:-825}
+      PROXY_AUTH_USER: ${PROXY_AUTH_USER:-}
+      PROXY_AUTH_PASSWORD: ${PROXY_AUTH_PASSWORD:-}
+      CBM_UI_PORT: ${CBM_UI_PORT:-9749}
+    ports:
+      - "${PROXY_BIND:-0.0.0.0}:${PROXY_PORT:-8443}:8443"
+    volumes:
+      # Writable: the proxy generates a self-signed cert here on first start. Drop in your own fullchain.pem/privkey.pem to use them instead.
+      - ./certs:/etc/nginx/certs
+
+volumes:
+  cbm-data:

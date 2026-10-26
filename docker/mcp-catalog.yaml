@@ -1,0 +1,21 @@
+# Docker MCP Gateway catalog entry for the running codebase-memory-mcp container (a remote, streamable-HTTP server).
+#
+#   docker mcp catalog import docker/mcp-catalog.yaml
+#   docker mcp gateway run --additional-catalog codebase-memory.yaml --servers codebase-memory
+#
+# The URL must be reachable from wherever the gateway runs:
+#   gateway on the host (docker mcp CLI plugin / Docker Desktop):  http://localhost:8811/mcp       (CBM_HTTP_PORT)
+#   gateway in a container on GATEWAY_NETWORK (compose.gateway.yaml): http://codebase-memory-mcp:8811/mcp
+# Plain HTTP on purpose: the gateway would reject ui-proxy's self-signed certificate.
+
+name: codebase-memory
+displayName: codebase-memory-mcp
+registry:
+  codebase-memory:
+    name: codebase-memory
+    title: codebase-memory-mcp
+    description: Code knowledge graph over the repositories mounted at CBM_WORKSPACE.
+    type: remote
+    remote:
+      transport_type: streamable-http
+      url: http://localhost:8811/mcp

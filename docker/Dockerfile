@@ -26,34 +26,16 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 WORKDIR /src
 COPY . .
 
-# Stamped into the binary (`codebase-memory-mcp --version`). Leave empty for a
-# "dev" stamp, or pass e.g. --build-arg CBM_VERSION=0.11.0.
+# Stamped into the binary (`codebase-memory-mcp --version`). Leave empty for "dev" stamp, or pass e.g. --build-arg CBM_VERSION=0.11.0.
 ARG CBM_VERSION=""
 # Cap parallel compile jobs on small machines / Docker Desktop VMs (0 = all).
 ARG BUILD_JOBS=0
 
 # onnxruntime-node (a transitive UI dev dependency) otherwise downloads the CUDA 12 execution provider from api.nuget.org in its postinstall on linux/x64.
-# The browser bundle never uses it; We don't need it. Skipping saves the download and removes a non-npm host from the build's network requirements.
+# We don't need it. Skipping saves the download and removes a non-npm host from the build's network requirements.
 
 ENV ONNXRUNTIME_NODE_INSTALL=skip \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-
-
-    # Streamable-HTTP bridge.
-ARG MCP_PROXY_VERSION=0.13.0
-
-
-
-# Install Python and the venv module
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-venv \
-    && rm -rf /var/lib/apt/lists/*
-    
-RUN python3 -m venv /opt/mcp-proxy \
-    && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
-    && /opt/mcp-proxy/bin/mcp-proxy --version
-
 
 # The npm cache mount keeps repeat UI builds fast without baking it into a layer.
 RUN --mount=type=cache,target=/root/.npm \
@@ -66,25 +48,30 @@ RUN --mount=type=cache,target=/root/.npm \
     CBM_NO_CCACHE=1 scripts/build.sh --with-ui ${CBM_VERSION:+--version "$CBM_VERSION"}; \
     install -Dm755 build/c/codebase-memory-mcp /out/codebase-memory-mcp; \
     /out/codebase-memory-mcp --version
-# streamable http server
 
-
-
-
-    # Runtime 
+# Runtime
 FROM ${UBUNTU_IMAGE} AS runtime
 
-# Installs:
-# zlib1g, libstdc++6: the binary's shared-library dependencies besides libc.
-# git:    the watcher and change detection shell out to it.
-# socat:  forwards the published UI port to the loopback-only UI listener.
-# tini:   PID 1 reaps the detached daemon and index workers, forwards signals.
-# procps: pgrep, used by the entrypoint's shutdown path.
+# Streamable-HTTP bridge version. Declared in this stage: ARGs do not cross FROM.
+ARG MCP_PROXY_VERSION=0.13.0
 
+# Dependencies for the binary and the HTTP bridge. 
 RUN apt-get update && apt-get install -y --no-install-recommends zlib1g libstdc++6 git socat tini procps ca-certificates && rm -rf /var/lib/apt/lists/*
 
+# Install Python and the venv module
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+    
+RUN python3 -m venv /opt/mcp-proxy \
+    && /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy==${MCP_PROXY_VERSION}" \
+    && /opt/mcp-proxy/bin/mcp-proxy --version
+
+    
 COPY --from=build /out/codebase-memory-mcp /usr/local/bin/codebase-memory-mcp
-COPY --chmod=755 entrypoint.sh /usr/local/bin/cbm-entrypoint
+# Build context is the repository root (see docker/compose.yaml).
+COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/cbm-entrypoint
 
 ENV HOME=/data \
     CBM_CACHE_DIR=/data/cache \

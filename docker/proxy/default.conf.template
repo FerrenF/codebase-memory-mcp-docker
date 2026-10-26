@@ -1,0 +1,23 @@
+# Reverse proxy for CBM Lens. Rendered at container start by envsubst; edit docker/.env, not this file.
+# CBM Lens only accepts Host/Origin of localhost:CBM_UI_PORT, so requests from the allowed origins are rewritten to it.
+
+map $http_origin $cbm_origin {
+    include /etc/nginx/cbm/origins.map;   # generated from PROXY_HOSTS and PROXY_PORT
+    default $http_origin;
+}
+
+server {
+    listen 8443 ssl;
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    include /etc/nginx/cbm/auth.conf;     # generated from PROXY_AUTH_USER / PROXY_AUTH_PASSWORD
+
+    location / {
+        proxy_pass http://cbm:19749;
+        proxy_set_header Host   localhost:${CBM_UI_PORT};
+        proxy_set_header Origin $cbm_origin;
+        proxy_http_version 1.1;
+        proxy_read_timeout 300s;
+    }
+}

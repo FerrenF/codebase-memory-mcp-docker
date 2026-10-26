@@ -1,0 +1,17 @@
+# Override: also attach cbm to an existing MCP gateway's Docker network (e.g. Harbor, or a containerized Docker MCP Gateway),
+# so the gateway reaches it at http://codebase-memory-mcp:${CBM_HTTP_PORT}/mcp without going through the host.
+#
+#   docker compose -f docker/compose.yaml -f docker/compose.gateway.yaml up -d --build
+#
+# Set GATEWAY_NETWORK in docker/.env (`docker network ls` lists the names).
+
+services:
+  cbm:
+    networks:
+      - default
+      - gateway
+
+networks:
+  gateway:
+    external: true
+    name: ${GATEWAY_NETWORK:?set GATEWAY_NETWORK in docker/.env}
