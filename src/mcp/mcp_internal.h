@@ -39,6 +39,13 @@ void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint
  * scratch count cannot see other processes' entries in the shared temp dir.
  * The server borrows dir until it is reset or the server is freed. */
 void cbm_mcp_server_set_search_scratch_dir_for_test(cbm_mcp_server_t *srv, const char *dir);
+/* search_code's in-process scan of `filelist_path` (records separated as the
+ * scoped list is written: NUL on POSIX, newline on Windows) into `out_path`.
+ * Returns the scan cause in mcp_scan_cause_t order: 0 success, 1 command
+ * failure, 3 output limit, 4 deadline, 5 cancelled. */
+int cbm_mcp_search_scan_for_test(cbm_mcp_server_t *srv, const char *filelist_path,
+                                 const char *pattern, bool use_regex, const char *out_path,
+                                 size_t output_limit, uint64_t deadline_ms);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
@@ -79,6 +86,16 @@ const char *cbm_mcp_edge_strategy_class(const char *strategy);
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
+/* True when the `ignore_worktrees` config key is on for this server (default
+ * off). Callers pair it with cbm_git_is_linked_worktree() to decide whether an
+ * automatic index of a linked worktree should be skipped. */
+bool cbm_mcp_ignore_worktrees_enabled(const cbm_mcp_server_t *srv);
+
+/* The same key when srv may have no store (the lifecycle hook). Never attaches
+ * a store to srv and never creates the runtime store; reads it only when it
+ * already exists. */
+bool cbm_mcp_ignore_worktrees_runtime_enabled(const cbm_mcp_server_t *srv);
+
 /* detect_changes seed scoping (#1363): does `node`'s line range overlap any
  * recorded hunk for `file`? Exposed for direct unit testing of the overlap
  * logic, independent of the git/subprocess/index plumbing around it. */
@@ -107,6 +124,13 @@ typedef bool (*cbm_mcp_snapshot_read_test_hook_fn)(void *context, const char *ab
 void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
                                                 cbm_mcp_snapshot_read_test_hook_fn hook,
                                                 void *context);
+
+/* Runs after get_code_snippet has read and verified a file's bytes and before
+ * it slices them, so a test can write the file at exactly that point (#2585). */
+typedef void (*cbm_mcp_snippet_capture_test_hook_fn)(void *context, const char *rel_path);
+void cbm_mcp_server_set_snippet_capture_test_hook(cbm_mcp_server_t *srv,
+                                                  cbm_mcp_snippet_capture_test_hook_fn hook,
+                                                  void *context);
 
 /* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
  * stored paths. This seam drives the normal search result ownership,

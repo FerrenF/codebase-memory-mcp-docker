@@ -9,6 +9,7 @@
 // for ISO timestamp
 
 #include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/arena.h"
@@ -54,9 +55,13 @@ enum {
     ST_GLOB_MIN_LEN = 3,
     ST_GLOB_SKIP = 2,
     ST_MAX_LANG = 10,
-    ST_SEARCH_MAX_BINDS = 32, /* increased: LIKE pre-filter adds binds per pattern */
-    ST_LIKE_POOL_MAX = 12,    /* max malloc'd LIKE strings alive during one search */
-    ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
+    ST_SEARCH_MAX_BINDS = 48,   /* LIKE pre-filters + anchored-name range bounds add binds */
+    ST_LIKE_POOL_MAX = 12,      /* max malloc'd LIKE strings alive during one search */
+    ST_LIKE_HINT_MAX = 2,       /* max LIKE hints extracted per regex pattern */
+    ST_NAME_RANGE_PREFIX = 64,  /* longest anchored name prefix seeked on */
+    ST_NAME_RANGE_LETTERS = 3,  /* case-insensitive: letters expanded into case variants */
+    ST_NAME_RANGE_MAX = 8,      /* 2^ST_NAME_RANGE_LETTERS name ranges (UNION ALL arms) */
+    ST_NAME_RANGE_ARM_SQL = 96, /* per-arm SQL beyond the select list and WHERE */
     ST_MAX_PKGS = 64,
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
@@ -69,10 +74,21 @@ enum {
     ST_HANDLER_PROP_LEN = 9,
     ST_BFS_CTE_ROW_MULTIPLIER = 8,
     ST_BFS_MAX_CTE_ROWS = 4096,
+    /* SQLite database header (fileformat2 §1.3) */
+    ST_DB_HEADER_LEN = 100,
+    ST_HDR_WRITE_VERSION = 18, /* 1 = rollback journal, 2 = WAL */
+    ST_HDR_READ_VERSION = 19,
+    ST_HDR_ROLLBACK = 1,
+    ST_HDR_CHANGE_COUNTER = 24,
+    ST_HDR_PAGE_COUNT = 28,
+    ST_BE_SHIFT_8 = 8,
+    ST_BE_SHIFT_16 = 16,
+    ST_BE_SHIFT_24 = 24,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "store/graph_mem.h"
 
 #include <stdatomic.h>
 #include "foundation/compat_fs.h"
@@ -121,6 +137,16 @@ struct cbm_store {
     const void *progress_owner; /* exclusive native progress guard token */
     const char *db_path;        /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
+    bool read_batch;                /* a read batch's transaction is open */
+    uint64_t read_batch_started_ms; /* when it was last (re)begun */
+    /* In-memory adjacency (graph_mem.h). Only a read-only query store of a
+     * sealed (rollback-journal) DB qualifies, keyed by its generation and
+     * file state (store_rollback_file_state). Acquired on the first walk,
+     * released at close. */
+    bool query_store;
+    bool graph_mem_tried;
+    cbm_graph_mem_t *graph_mem;
+    cbm_graph_mem_types_t graph_mem_degree_mask; /* search's in_deg/out_deg types */
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -157,6 +183,15 @@ struct cbm_store {
     sqlite3_stmt *stmt_get_file_hashes;
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
+
+    /* ADRs live in a per-project sidecar DB ("<db_path>.adr.db"), NOT in the
+     * graph DB, so a reindex that rebuilds/replaces the graph DB never touches
+     * them (removing the capture/re-apply race entirely). The read-write handle
+     * is lazily opened on the first ADR write/migration and cached for the
+     * store's lifetime; NULL for a :memory: store, where ADRs stay in the graph
+     * DB (never file-swapped, no race). Reads open a short-lived read-only
+     * handle so a query-only cache is never mutated. */
+    sqlite3 *adr_db;
 };
 
 /* ── Helpers ────────────────────────────────────────────────────── */
@@ -167,6 +202,13 @@ static void store_set_error(cbm_store_t *s, const char *msg) {
 
 static void store_set_error_sqlite(cbm_store_t *s, const char *prefix) {
     snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(s->db));
+}
+
+/* Like store_set_error_sqlite but reads the message from an explicit
+ * connection — used for the ADR sidecar DB, whose errors do not live on
+ * s->db. */
+static void store_set_error_sqlite_on(cbm_store_t *s, sqlite3 *db, const char *prefix) {
+    snprintf(s->errbuf, sizeof(s->errbuf), "%s: %s", prefix, sqlite3_errmsg(db));
 }
 
 static int exec_sql(cbm_store_t *s, const char *sql) {
@@ -207,10 +249,60 @@ static char *heap_strdup(const char *s) {
 }
 
 /* Prepare a statement (cached). If already prepared, reset+clear. */
+/* ── Read batch ────────────────────────────────────────────────────
+ * A read tool issues thousands of small statements. In autocommit mode each
+ * one takes and drops the database file lock and stats the journal and WAL
+ * files — most of a whole-graph count(*)'s time. A read batch runs them in one
+ * deferred read transaction, renewed every ST_READ_BATCH_MS at the next
+ * statement: a writer never waits behind the batch much longer than that, and
+ * every statement still reads data committed at most that long ago (while the
+ * batch holds a rollback-journal database's shared lock, no commit happens).
+ * Committing a read transaction is allowed with read statements still
+ * stepping; their lock is then held until they finish, as before. */
+enum { ST_READ_BATCH_MS = 100 };
+
+bool cbm_store_read_batch_begin(cbm_store_t *s) {
+    if (!s || !s->db || s->read_batch || !sqlite3_get_autocommit(s->db)) {
+        return false;
+    }
+    if (sqlite3_exec(s->db, "BEGIN DEFERRED;", NULL, NULL, NULL) != SQLITE_OK) {
+        return false;
+    }
+    s->read_batch = true;
+    s->read_batch_started_ms = cbm_now_ms();
+    return true;
+}
+
+void cbm_store_read_batch_end(cbm_store_t *s) {
+    if (!s || !s->read_batch) {
+        return;
+    }
+    s->read_batch = false;
+    if (s->db && !sqlite3_get_autocommit(s->db)) {
+        (void)sqlite3_exec(s->db, "COMMIT;", NULL, NULL, NULL);
+    }
+}
+
+void cbm_store_read_batch_expire_for_test(cbm_store_t *s) {
+    if (s && s->read_batch) {
+        uint64_t now = cbm_now_ms();
+        s->read_batch_started_ms = now > ST_READ_BATCH_MS ? now - ST_READ_BATCH_MS : 0;
+    }
+}
+
+static void read_batch_renew(cbm_store_t *s) {
+    if (!s->read_batch || cbm_now_ms() - s->read_batch_started_ms < ST_READ_BATCH_MS) {
+        return;
+    }
+    cbm_store_read_batch_end(s);
+    (void)cbm_store_read_batch_begin(s);
+}
+
 static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const char *sql) {
     if (!s || !s->db) {
         return NULL;
     }
+    read_batch_renew(s);
     if (*slot) {
         sqlite3_reset(*slot);
         sqlite3_clear_bindings(*slot);
@@ -347,6 +439,20 @@ static int init_schema(cbm_store_t *s) {
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
         ");"
+        "CREATE INDEX IF NOT EXISTS idx_index_coverage_project_kind "
+        "ON index_coverage(project, kind);"
+        /* Derived candidate lookup: inbound traces read only this index, not
+         * every file's diagnostic JSON. An empty candidate marks truncated or
+         * malformed evidence, whose omitted candidates cannot be ruled out. */
+        "CREATE TABLE IF NOT EXISTS index_unresolved_candidates ("
+        "  project TEXT NOT NULL,"
+        "  candidate TEXT NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  kind TEXT NOT NULL DEFAULT 'unresolved_calls' CHECK(kind='unresolved_calls'),"
+        "  PRIMARY KEY(project, candidate, rel_path),"
+        "  FOREIGN KEY(project, rel_path, kind) "
+        "    REFERENCES index_coverage(project, rel_path, kind) ON DELETE CASCADE"
+        ");"
         /* Observed runtime calls (ingest_traces). Deliberately SEPARATE from
          * the graph tables (like index_coverage) and keyed by QUALIFIED NAME,
          * not node id: node ids are reassigned on every reindex, so id-keyed
@@ -387,12 +493,40 @@ static int init_schema(cbm_store_t *s) {
         "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
         "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
         "  coverage_version INTEGER NOT NULL DEFAULT 1,"
-        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0,"
+        "  unresolved_calls_complete INTEGER NOT NULL DEFAULT 0"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+
+    /* Existing writable stores retain their ordinary coverage metadata, but
+     * unresolved capture is untrusted until a full generation records it. */
+    sqlite3_stmt *coverage_columns = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA table_info(index_coverage_meta);", CBM_NOT_FOUND,
+                           &coverage_columns, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage meta schema prepare");
+        return CBM_STORE_ERR;
+    }
+    bool have_unresolved_complete = false;
+    int column_rc;
+    while ((column_rc = sqlite3_step(coverage_columns)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(coverage_columns, SKIP_ONE);
+        if (name && strcmp(name, "unresolved_calls_complete") == 0) {
+            have_unresolved_complete = true;
+        }
+    }
+    sqlite3_finalize(coverage_columns);
+    if (column_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage meta schema scan");
+        return CBM_STORE_ERR;
+    }
+    if (!have_unresolved_complete &&
+        exec_sql(s, "ALTER TABLE index_coverage_meta ADD COLUMN "
+                    "unresolved_calls_complete INTEGER NOT NULL DEFAULT 0;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     /* Schema-compat probe (#768): DBs created before the local_name_gen
@@ -1132,6 +1266,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    s->query_store = true;
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -1363,6 +1498,7 @@ void cbm_store_close(cbm_store_t *s) {
     if (!s) {
         return;
     }
+    cbm_store_read_batch_end(s);
 
     /* Checkpoint WAL before close to prevent orphan WAL accumulation.
      * Best-effort — silently skips if concurrent reader holds a lock. */
@@ -1409,6 +1545,12 @@ void cbm_store_close(cbm_store_t *s) {
     /* Use sqlite3_close_v2 — auto-deallocates when last statement finalizes.
      * Prevents ASan false-positive leaks from sqlite3 internal state. */
     sqlite3_close_v2(s->db);
+    cbm_graph_mem_release(s->graph_mem);
+    /* ADR sidecar: checkpoint + close its own connection (file stores only). */
+    if (s->adr_db) {
+        (void)sqlite3_wal_checkpoint_v2(s->adr_db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+        sqlite3_close_v2(s->adr_db);
+    }
     safe_str_free(&s->db_path);
     free(s);
 }
@@ -3056,11 +3198,12 @@ static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
     n->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
 }
 
+static const char st_find_node_by_id_sql[] =
+    "SELECT id, project, label, name, qualified_name, file_path, "
+    "start_line, end_line, properties FROM nodes WHERE id = ?1;";
+
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
-    sqlite3_stmt *stmt =
-        prepare_cached(s, &s->stmt_find_node_by_id,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes WHERE id = ?1;");
+    sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_node_by_id, st_find_node_by_id_sql);
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -3293,6 +3436,280 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               "start_line, end_line, properties FROM nodes "
                               "WHERE project = ?1 AND file_path = ?2;",
                               project, file_path, out, count);
+}
+
+/* ── Streamed node scan ──────────────────────────────────────────────
+ * cbm_store_find_nodes / cbm_store_find_nodes_by_label materialise every row
+ * at once: 8.5 M kernel nodes with all their strings are 4.9 GB before the
+ * caller sees the first one. The scan below hands the same rows out a page at
+ * a time, and resets each page's statement before returning it, so no read
+ * lock outlives a page: a writer waits behind one page, as behind one eager
+ * lookup, never behind the caller's whole query.
+ *
+ * Pages continue by keyset along the index the eager query walks, so they
+ * concatenate to the eager order:
+ *   all nodes  idx_nodes_file (project, file_path): the NULL file_path rows by
+ *              id (index order puts NULL first), then by (file_path, id). A
+ *              page continues with the rest of its last row's file (by id),
+ *              then with the files after it: two exact index seeks, where a
+ *              (file_path, id) row-value bound seeks the file only and would
+ *              rescan a large file from its start on every page;
+ *   one label  idx_nodes_label (project, label): by id.
+ * open checks that plan with EXPLAIN QUERY PLAN on the eager query itself.
+ * Any other plan (a changed schema, planner statistics) falls back to the
+ * eager scan handed out in batches: the same rows, without the saving. */
+#define NODE_SCAN_COLS                                                                   \
+    "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, " \
+    "properties FROM nodes "
+
+typedef enum {
+    NODE_SCAN_LABEL,      /* label = ?2 AND id >= ?3 */
+    NODE_SCAN_NULL_FILE,  /* file_path IS NULL AND id >= ?2 */
+    NODE_SCAN_FILE_FIRST, /* file_path IS NOT NULL: the first file page */
+    NODE_SCAN_FILE_SAME,  /* file_path = ?2 AND id > ?3: the rest of the last file */
+    NODE_SCAN_FILE_AFTER, /* file_path > ?2: the files after it */
+    NODE_SCAN_STMTS,
+} node_scan_stmt_t;
+
+enum { NODE_SCAN_COL_FILE = 5 }; /* file_path in NODE_SCAN_COLS */
+
+static const char *const node_scan_sql[NODE_SCAN_STMTS] = {
+    NODE_SCAN_COLS "WHERE project = ?1 AND label = ?2 AND id >= ?3 ORDER BY id LIMIT ?4;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path IS NULL AND id >= ?2 ORDER BY id LIMIT ?3;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path IS NOT NULL ORDER BY file_path, id LIMIT ?2;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path = ?2 AND id > ?3 ORDER BY id LIMIT ?4;",
+    NODE_SCAN_COLS "WHERE project = ?1 AND file_path > ?2 ORDER BY file_path, id LIMIT ?3;",
+};
+
+struct cbm_store_node_scan {
+    cbm_store_t *store;
+    char *project;
+    char *label;
+    bool paged;
+    node_scan_stmt_t phase; /* LABEL, NULL_FILE, FILE_SAME or FILE_AFTER */
+    bool keyed;             /* last_id (and for files last_file) hold the previous page's end */
+    int64_t last_id;
+    sqlite3_value *last_file;
+    sqlite3_stmt *stmts[NODE_SCAN_STMTS];
+    bool done;
+    bool eager_failed; /* fallback: the eager scan itself failed; next reports it once */
+    cbm_node_t *eager; /* fallback: the eager scan's rows, handed out in order */
+    int eager_count;
+    int eager_next;
+};
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static atomic_int node_scan_test_fail_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+
+void cbm_store_node_scan_test_fail_page_after(int successful_pages) {
+    atomic_store(&node_scan_test_fail_countdown, successful_pages);
+}
+#endif
+
+/* True when SQLite runs `sql` as the single index search `plan`. */
+static bool node_scan_plan_is(cbm_store_t *s, const char *sql, const char *plan) {
+    char eqp[CBM_SZ_512];
+    snprintf(eqp, sizeof(eqp), "EXPLAIN QUERY PLAN %s", sql);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, eqp, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
+    int rows = 0;
+    bool match = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *detail = (const char *)sqlite3_column_text(stmt, ST_COL_3);
+        match = rows == 0 && detail && strcmp(detail, plan) == 0;
+        rows++;
+    }
+    sqlite3_finalize(stmt);
+    return match && rows == SKIP_ONE;
+}
+
+cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *project,
+                                                const char *label) {
+    if (!s || !s->db) {
+        return NULL;
+    }
+    cbm_store_node_scan_t *scan = cbm_calloc(CBM_MEM_CLASS_STORE, sizeof(*scan));
+    if (!scan) {
+        return NULL;
+    }
+    scan->store = s;
+    scan->project = cbm_mem_strdup(CBM_MEM_CLASS_STORE, project);
+    scan->label = cbm_mem_strdup(CBM_MEM_CLASS_STORE, label);
+    if ((project && !scan->project) || (label && !scan->label)) {
+        cbm_store_node_scan_close(scan);
+        return NULL;
+    }
+    scan->phase = label ? NODE_SCAN_LABEL : NODE_SCAN_NULL_FILE; /* NULL file_path rows first */
+    if (label) {
+        scan->paged =
+            node_scan_plan_is(s, NODE_SCAN_COLS "WHERE project = ?1 AND label = ?2;",
+                              "SEARCH nodes USING INDEX idx_nodes_label (project=? AND label=?)");
+    } else {
+        scan->paged = node_scan_plan_is(s, NODE_SCAN_COLS "WHERE project = ?1;",
+                                        "SEARCH nodes USING INDEX idx_nodes_file (project=?)");
+    }
+    if (!scan->paged) {
+        int rc = label ? cbm_store_find_nodes_by_label(s, project, label, &scan->eager,
+                                                       &scan->eager_count)
+                       : cbm_store_find_nodes(s, project, &scan->eager, &scan->eager_count);
+        scan->eager_failed = rc != CBM_STORE_OK;
+    }
+    return scan;
+}
+
+bool cbm_store_node_scan_paged(const cbm_store_node_scan_t *scan) {
+    return scan && scan->paged;
+}
+
+/* The current phase has no rows left. The NULL file_path rows hand over to
+ * the files, the rest of a file to the files after it; a label's rows and
+ * the files after the last one end the scan. */
+static void node_scan_phase_done(cbm_store_node_scan_t *scan) {
+    if (scan->phase == NODE_SCAN_NULL_FILE) {
+        scan->keyed = false;
+        scan->phase = NODE_SCAN_FILE_AFTER;
+    } else if (scan->phase == NODE_SCAN_FILE_SAME) {
+        scan->phase = NODE_SCAN_FILE_AFTER; /* after last_file */
+    } else {
+        scan->done = true;
+    }
+}
+
+static void node_scan_bind(cbm_store_node_scan_t *scan, sqlite3_stmt *stmt, node_scan_stmt_t which,
+                           int max) {
+    int col = SKIP_ONE;
+    bind_text(stmt, col++, scan->project);
+    if (which == NODE_SCAN_LABEL) {
+        bind_text(stmt, col++, scan->label);
+    }
+    if (which == NODE_SCAN_FILE_SAME || which == NODE_SCAN_FILE_AFTER) {
+        sqlite3_bind_value(stmt, col++, scan->last_file);
+    }
+    if (which == NODE_SCAN_LABEL || which == NODE_SCAN_NULL_FILE) {
+        sqlite3_bind_int64(stmt, col++, scan->keyed ? scan->last_id + SKIP_ONE : INT64_MIN);
+    } else if (which == NODE_SCAN_FILE_SAME) {
+        sqlite3_bind_int64(stmt, col++, scan->last_id);
+    }
+    sqlite3_bind_int(stmt, col, max);
+}
+
+/* One page of the current phase into out[0..max). A short page ends the
+ * phase; the statement is reset before returning either way. */
+static int node_scan_page(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *got) {
+    *got = 0;
+    cbm_store_t *s = scan->store;
+    node_scan_stmt_t which = scan->phase;
+    if (which == NODE_SCAN_FILE_AFTER && !scan->keyed) {
+        which = NODE_SCAN_FILE_FIRST;
+    }
+    bool after_id =
+        which == NODE_SCAN_LABEL || which == NODE_SCAN_NULL_FILE || which == NODE_SCAN_FILE_SAME;
+    if (after_id && scan->keyed && scan->last_id == INT64_MAX) {
+        node_scan_phase_done(scan); /* nothing can follow the largest id */
+        return CBM_STORE_OK;
+    }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&node_scan_test_fail_countdown)) {
+        snprintf(s->errbuf, sizeof(s->errbuf), "node scan aborted: injected page failure");
+        return CBM_STORE_ERR;
+    }
+#endif
+    read_batch_renew(s);
+    sqlite3_stmt **slot = &scan->stmts[which];
+    if (!*slot &&
+        sqlite3_prepare_v2(s->db, node_scan_sql[which], CBM_NOT_FOUND, slot, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "node scan prepare");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = *slot;
+    node_scan_bind(scan, stmt, which, max);
+
+    int n = 0;
+    int rc = SQLITE_ROW;
+    while (n < max && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        scan_node(stmt, &out[n]);
+        n++;
+    }
+    bool failed = n < max && rc != SQLITE_DONE;
+    if (n == max) { /* the statement still sits on the page's last row */
+        scan->keyed = true;
+        scan->last_id = out[n - SKIP_ONE].id;
+        if (which == NODE_SCAN_FILE_FIRST || which == NODE_SCAN_FILE_AFTER) {
+            /* a new last file: continue with the rest of it */
+            sqlite3_value_free(scan->last_file);
+            scan->last_file = sqlite3_value_dup(sqlite3_column_value(stmt, NODE_SCAN_COL_FILE));
+            failed = !scan->last_file;
+            scan->phase = NODE_SCAN_FILE_SAME;
+        }
+    }
+    sqlite3_reset(stmt);
+    if (failed) {
+        store_set_error_sqlite(s, "node scan aborted");
+        for (int i = 0; i < n; i++) {
+            cbm_node_free_fields(&out[i]);
+        }
+        return CBM_STORE_ERR;
+    }
+    if (n < max) {
+        node_scan_phase_done(scan);
+    }
+    *got = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_node_scan_next(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *count) {
+    *count = 0;
+    if (!scan || max <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (scan->eager_failed) {
+        scan->eager_failed = false; /* reported once; the scan then reads as exhausted */
+        return CBM_STORE_ERR;
+    }
+    if (!scan->paged) {
+        int left = scan->eager_count - scan->eager_next;
+        int n = left < max ? left : max;
+        if (n > 0) {
+            memcpy(out, scan->eager + scan->eager_next, (size_t)n * sizeof(cbm_node_t));
+            memset(scan->eager + scan->eager_next, 0, (size_t)n * sizeof(cbm_node_t));
+            scan->eager_next += n;
+        }
+        *count = n;
+        return CBM_STORE_OK;
+    }
+    int n = 0;
+    while (n < max && !scan->done) {
+        int got = 0;
+        if (node_scan_page(scan, out + n, max - n, &got) != CBM_STORE_OK) {
+            /* A failed page yields no rows from this call and ends the scan;
+             * cbm_store_error() names the failure. */
+            for (int i = 0; i < n; i++) {
+                cbm_node_free_fields(&out[i]);
+            }
+            scan->done = true;
+            return CBM_STORE_ERR;
+        }
+        n += got;
+    }
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+void cbm_store_node_scan_close(cbm_store_node_scan_t *scan) {
+    if (!scan) {
+        return;
+    }
+    for (int i = 0; i < NODE_SCAN_STMTS; i++) {
+        sqlite3_finalize(scan->stmts[i]);
+    }
+    sqlite3_value_free(scan->last_file);
+    cbm_store_free_nodes(scan->eager, scan->eager_count); /* rows not handed out */
+    cbm_free(CBM_MEM_CLASS_STORE, scan->project);
+    cbm_free(CBM_MEM_CLASS_STORE, scan->label);
+    cbm_free(CBM_MEM_CLASS_STORE, scan);
 }
 
 typedef struct {
@@ -3769,10 +4186,18 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     bind_text(stmt, SKIP_ONE, project);
     sqlite3_bind_int(stmt, 2, max_edges > 0 ? max_edges + SKIP_ONE : CBM_NOT_FOUND);
 
+    /* Both arrays are STORE-class memory-core blocks: the caller releases them
+     * with cbm_store_free_call_edges, the only free that matches. */
     int cap = ST_INIT_CAP_16;
     int n = 0;
-    int64_t *src = malloc((size_t)cap * sizeof(int64_t));
-    int64_t *tgt = malloc((size_t)cap * sizeof(int64_t));
+    int64_t *src = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(int64_t));
+    int64_t *tgt = cbm_alloc(CBM_MEM_CLASS_STORE, (size_t)cap * sizeof(int64_t));
+    if (!src || !tgt) {
+        sqlite3_finalize(stmt);
+        cbm_store_free_call_edges(src, tgt);
+        store_set_error(s, "fetch_call_edges: out of memory");
+        return CBM_STORE_ERR;
+    }
     int scan_rc;
     while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (max_edges > 0 && n >= max_edges) {
@@ -3782,9 +4207,23 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
             break;
         }
         if (n >= cap) {
+            size_t grown_bytes = (size_t)cap * ST_GROWTH * sizeof(int64_t);
+            int64_t *grown_src = cbm_realloc(CBM_MEM_CLASS_STORE, src, grown_bytes);
+            if (grown_src) {
+                src = grown_src;
+            }
+            int64_t *grown_tgt =
+                grown_src ? cbm_realloc(CBM_MEM_CLASS_STORE, tgt, grown_bytes) : NULL;
+            if (grown_tgt) {
+                tgt = grown_tgt;
+            }
+            if (!grown_src || !grown_tgt) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_call_edges(src, tgt);
+                store_set_error(s, "fetch_call_edges: out of memory");
+                return CBM_STORE_ERR;
+            }
             cap *= ST_GROWTH;
-            src = safe_realloc(src, (size_t)cap * sizeof(int64_t));
-            tgt = safe_realloc(tgt, (size_t)cap * sizeof(int64_t));
         }
         src[n] = sqlite3_column_int64(stmt, 0);
         tgt[n] = sqlite3_column_int64(stmt, 1);
@@ -3792,8 +4231,7 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     }
     sqlite3_finalize(stmt);
     if (scan_rc != SQLITE_DONE && scan_rc != SQLITE_ROW) {
-        free(src);
-        free(tgt);
+        cbm_store_free_call_edges(src, tgt);
         store_set_error_sqlite(s, "fetch_call_edges scan");
         return CBM_STORE_ERR;
     }
@@ -3801,6 +4239,11 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     *out_tgt = tgt;
     *count = n;
     return CBM_STORE_OK;
+}
+
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt) {
+    cbm_free(CBM_MEM_CLASS_STORE, src);
+    cbm_free(CBM_MEM_CLASS_STORE, tgt);
 }
 
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
@@ -4120,6 +4563,18 @@ static void cov_json_escape(char *dst, size_t dstsz, const char *src) {
  * {kind, detail}. Queryable via query_graph(graph="missed") with zero
  * cypher-engine changes; the real project's graph gains no rows. Derived
  * data — rebuilt from the authoritative (post-prune) table contents. */
+/* Coverage kinds that never materialize in the miss graph. not_indexed_*
+ * rows are by-design exclusions, not failures. unresolved_calls rows (#2265)
+ * describe files that WERE indexed; their call evidence is reported by
+ * check_index_coverage and trace_path, and as a File row it would also
+ * replace a parse_partial row for the same path (rows arrive ordered by
+ * rel_path, kind, and the File upsert keeps the last one). */
+static bool cov_kind_outside_miss_graph(const char *kind) {
+    static const char by_design_prefix[] = "not_indexed";
+    return strncmp(kind, by_design_prefix, sizeof(by_design_prefix) - 1) == 0 ||
+           strcmp(kind, "unresolved_calls") == 0;
+}
+
 /* Fingerprint of the FAILURE rows the shadow graph derives from. When the
  * set is unchanged since the last rebuild, the wipe-and-rebuild (tens of
  * thousands of node/edge upserts probing the full-size nodes index -- a
@@ -4131,7 +4586,7 @@ static void cov_failure_fingerprint(const cbm_coverage_row_t *rows, int count,
     cbm_sha256_ctx sha;
     cbm_sha256_init(&sha);
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+        if (!rows[i].kind || cov_kind_outside_miss_graph(rows[i].kind)) {
             continue;
         }
         const char *rel = rows[i].rel_path ? rows[i].rel_path : "";
@@ -4230,11 +4685,11 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         return CBM_STORE_OK;
     }
     /* Only FAILURE rows materialize in the miss graph; a project whose only
-     * coverage rows are by-design not_indexed_* entries gets NO graph (not
-     * even a bare root node). */
+     * coverage rows are by-design not_indexed_* entries or unresolved_calls
+     * evidence gets NO graph (not even a bare root node). */
     int failure_count = 0;
     for (int i = 0; i < count; i++) {
-        if (!rows[i].kind || strncmp(rows[i].kind, "not_indexed", 11) != 0) {
+        if (!rows[i].kind || !cov_kind_outside_miss_graph(rows[i].kind)) {
             failure_count++;
         }
     }
@@ -4275,8 +4730,10 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
         }
         /* The missed graph shows FAILURES ("we did not manage") only —
          * by-design not_indexed_* rows stay out of it, so the UI's
-         * report-an-edge-case callout never fires for gitignored paths. */
-        if (rows[i].kind && strncmp(rows[i].kind, "not_indexed", 11) == 0) {
+         * report-an-edge-case callout never fires for gitignored paths, and
+         * unresolved_calls rows stay out so a parse_partial row for the same
+         * file keeps its File node. */
+        if (rows[i].kind && cov_kind_outside_miss_graph(rows[i].kind)) {
             continue;
         }
         char pathbuf[CBM_SZ_1K];
@@ -4381,6 +4838,114 @@ static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     return CBM_STORE_OK;
 }
 
+/* Materialize once at publication, after replacement and deleted-file pruning.
+ * json_each sees a safe marker array for malformed/legacy non-array payloads.
+ * The side table cascades with its authoritative coverage rows. */
+static int coverage_index_unresolved_candidates(cbm_store_t *s, const char *project) {
+    static const char sql[] =
+        "INSERT OR IGNORE INTO index_unresolved_candidates(project, candidate, rel_path) "
+        "SELECT c.project, CASE WHEN j.type != 'object' OR "
+        "json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.truncated') = 1 "
+        "THEN '' "
+        "ELSE json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.candidate') "
+        "END, c.rel_path "
+        "FROM index_coverage c, json_each(CASE "
+        "WHEN json_valid(c.detail) THEN CASE WHEN json_type(c.detail) = 'array' "
+        "THEN c.detail ELSE '[{\"truncated\":true}]' END "
+        "ELSE '[{\"truncated\":true}]' END) j "
+        "WHERE c.project = ?1 AND c.kind = 'unresolved_calls' AND "
+        "(j.type != 'object' OR json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' "
+        "END, '$.truncated') = 1 OR "
+        "(json_type(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, '$.candidate') = "
+        "'text' AND "
+        "length(json_extract(CASE WHEN j.type = 'object' THEN j.value ELSE '{}' END, "
+        "'$.candidate')) > 0));";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved candidate index prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "unresolved candidate index");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* The caller owns the coverage transaction and rolls it back on failure. */
+static int coverage_write_metadata(cbm_store_t *s, const char *project,
+                                   const cbm_coverage_meta_t *meta) {
+    enum { COVERAGE_META_INITIAL_VERSION = 1 };
+    if (!meta) {
+        sqlite3_stmt *del_meta = NULL;
+        if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
+                               CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta delete prepare");
+            return CBM_STORE_ERR;
+        }
+        bind_text(del_meta, SKIP_ONE, project);
+        int meta_rc = sqlite3_step(del_meta);
+        sqlite3_finalize(del_meta);
+        if (meta_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "coverage meta delete");
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_OK;
+    }
+    char recorded_at[CBM_SZ_64];
+    if (meta->recorded_at && meta->recorded_at[0]) {
+        (void)snprintf(recorded_at, sizeof(recorded_at), "%s", meta->recorded_at);
+    } else {
+        iso_now(recorded_at, sizeof(recorded_at));
+    }
+    const char *generation =
+        meta->generation && meta->generation[0] ? meta->generation : recorded_at;
+    const char *index_mode = meta->index_mode && meta->index_mode[0] ? meta->index_mode : "unknown";
+    const char *recording_status = meta->recording_status && meta->recording_status[0]
+                                       ? meta->recording_status
+                                       : "unavailable";
+    int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
+    int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
+    int coverage_version =
+        meta->coverage_version > 0 ? meta->coverage_version : COVERAGE_META_INITIAL_VERSION;
+
+    sqlite3_stmt *up_meta = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "INSERT INTO index_coverage_meta "
+                           "(project, generation, index_mode, recorded_at, recording_status, "
+                           " ignored_files_stored, ignored_files_total, coverage_version, "
+                           " hash_records_complete, unresolved_calls_complete) "
+                           "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+                           "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
+                           "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
+                           "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9, "
+                           "unresolved_calls_complete=?10;",
+                           CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage meta upsert prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(up_meta, SKIP_ONE, project);
+    bind_text(up_meta, ST_COL_2, generation);
+    bind_text(up_meta, ST_COL_3, index_mode);
+    bind_text(up_meta, CBM_SZ_4, recorded_at);
+    bind_text(up_meta, CBM_SZ_5, recording_status);
+    sqlite3_bind_int(up_meta, ST_COL_6, ignored_stored);
+    sqlite3_bind_int(up_meta, ST_COL_7, ignored_total);
+    sqlite3_bind_int(up_meta, ST_COL_8, coverage_version);
+    sqlite3_bind_int(up_meta, ST_COL_9, meta->hash_records_complete);
+    sqlite3_bind_int(up_meta, ST_COL_10, meta->unresolved_calls_complete);
+    int meta_rc = sqlite3_step(up_meta);
+    sqlite3_finalize(up_meta);
+    if (meta_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage meta upsert");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                                   const cbm_coverage_row_t *rows, int count,
                                   const cbm_coverage_meta_t *meta) {
@@ -4478,72 +5043,14 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         (cov_t1.tv_sec - cov_t0.tv_sec) * 1000 + (cov_t1.tv_nsec - cov_t0.tv_nsec) / 1000000;
     cov_t0 = cov_t1;
 
-    if (meta) {
-        char recorded_at[CBM_SZ_64];
-        if (meta->recorded_at && meta->recorded_at[0]) {
-            snprintf(recorded_at, sizeof(recorded_at), "%s", meta->recorded_at);
-        } else {
-            iso_now(recorded_at, sizeof(recorded_at));
-        }
-        const char *generation =
-            meta->generation && meta->generation[0] ? meta->generation : recorded_at;
-        const char *index_mode =
-            meta->index_mode && meta->index_mode[0] ? meta->index_mode : "unknown";
-        const char *recording_status = meta->recording_status && meta->recording_status[0]
-                                           ? meta->recording_status
-                                           : "unavailable";
-        int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
-        int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
-        int coverage_version = meta->coverage_version > 0 ? meta->coverage_version : 1;
+    if (coverage_index_unresolved_candidates(s, project) != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
 
-        sqlite3_stmt *up_meta = NULL;
-        if (sqlite3_prepare_v2(
-                s->db,
-                "INSERT INTO index_coverage_meta "
-                "(project, generation, index_mode, recorded_at, recording_status, "
-                " ignored_files_stored, ignored_files_total, coverage_version, "
-                " hash_records_complete) "
-                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
-                "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
-                "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
-                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
-                CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
-            store_set_error_sqlite(s, "coverage meta upsert prepare");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-        bind_text(up_meta, SKIP_ONE, project);
-        bind_text(up_meta, ST_COL_2, generation);
-        bind_text(up_meta, ST_COL_3, index_mode);
-        bind_text(up_meta, CBM_SZ_4, recorded_at);
-        bind_text(up_meta, CBM_SZ_5, recording_status);
-        sqlite3_bind_int(up_meta, 6, ignored_stored);
-        sqlite3_bind_int(up_meta, 7, ignored_total);
-        sqlite3_bind_int(up_meta, 8, coverage_version);
-        sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
-        int meta_rc = sqlite3_step(up_meta);
-        sqlite3_finalize(up_meta);
-        if (meta_rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "coverage meta upsert");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-    } else {
-        sqlite3_stmt *del_meta = NULL;
-        if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
-                               CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
-            store_set_error_sqlite(s, "coverage meta delete prepare");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
-        bind_text(del_meta, SKIP_ONE, project);
-        int meta_rc = sqlite3_step(del_meta);
-        sqlite3_finalize(del_meta);
-        if (meta_rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "coverage meta delete");
-            (void)exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
+    if (coverage_write_metadata(s, project, meta) != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
     }
 
     /* Rebuild the derived miss-graph view from the now-authoritative table
@@ -4665,6 +5172,43 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
     return coverage_query_rows(s, project, scope, sql, out, count);
 }
 
+int cbm_store_coverage_get_unresolved_path(cbm_store_t *s, const char *project,
+                                           const char *rel_path, cbm_coverage_row_t **out,
+                                           int *count) {
+    static const char sql[] = "SELECT rel_path, kind, detail FROM index_coverage "
+                              "WHERE project = ?1 AND rel_path = ?2 "
+                              "AND kind = 'unresolved_calls';";
+    return coverage_query_rows(s, project, rel_path, sql, out, count);
+}
+
+int cbm_store_coverage_has_unresolved_candidate(cbm_store_t *s, const char *project,
+                                                const char *candidate, bool *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    *out = false;
+    if (!s || !s->db || !project || !candidate) {
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] = "SELECT 1 FROM index_unresolved_candidates "
+                              "WHERE project = ?1 AND candidate IN ('', ?2) LIMIT 1;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "unresolved candidate lookup prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, candidate);
+    int rc = sqlite3_step(stmt);
+    *out = rc == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "unresolved candidate lookup");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
     if (!meta) {
         return;
@@ -4689,10 +5233,20 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
     if (sqlite3_prepare_v2(s->db,
                            "SELECT project, generation, index_mode, recorded_at, recording_status, "
                            "ignored_files_stored, ignored_files_total, coverage_version, "
-                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
+                           "hash_records_complete, unresolved_calls_complete "
+                           "FROM index_coverage_meta WHERE project = ?1;",
                            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "coverage meta get prepare");
-        return CBM_STORE_ERR;
+        /* Query opens never migrate a legacy database. Preserve its ordinary
+         * report while the absent new signal remains explicitly incomplete. */
+        if (sqlite3_prepare_v2(
+                s->db,
+                "SELECT project, generation, index_mode, recorded_at, recording_status, "
+                "ignored_files_stored, ignored_files_total, coverage_version, "
+                "hash_records_complete, 0 FROM index_coverage_meta WHERE project = ?1;",
+                CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta get prepare");
+            return CBM_STORE_ERR;
+        }
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
@@ -4706,6 +5260,7 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         out->ignored_files_total = sqlite3_column_int(stmt, 6);
         out->coverage_version = sqlite3_column_int(stmt, 7);
         out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        out->unresolved_calls_complete = sqlite3_column_int(stmt, ST_COL_9) != 0;
         sqlite3_finalize(stmt);
         if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
             !out->recording_status) {
@@ -6302,6 +6857,100 @@ int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src) {
     return CBM_STORE_OK;
 }
 
+/* ── In-memory adjacency ─────────────────────────────────────────── */
+
+/* The edge types search_graph's in_deg/out_deg count (cbm_store_search). */
+static const char *const st_degree_types[] = {"CALLS", "USAGE", "CALL_REFERENCE", "INHERITS",
+                                              "IMPLEMENTS"};
+
+/* cbm_adj_degree(id, inbound): the in-memory twin of search's two
+ * correlated COUNT(*) subqueries over st_degree_types. */
+static void sqlite_graph_mem_degree(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const cbm_store_t *s = sqlite3_user_data(ctx);
+    sqlite3_result_int(ctx, cbm_graph_mem_degree(s->graph_mem, sqlite3_value_int64(argv[0]),
+                                                 sqlite3_value_int(argv[SKIP_ONE]) != 0,
+                                                 s->graph_mem_degree_mask));
+}
+
+static uint32_t st_be32(const unsigned char *p) {
+    return ((uint32_t)p[0] << ST_BE_SHIFT_24) | ((uint32_t)p[SKIP_ONE] << ST_BE_SHIFT_16) |
+           ((uint32_t)p[ST_COL_2] << ST_BE_SHIFT_8) | (uint32_t)p[ST_COL_3];
+}
+
+/* The committed state of a rollback-journal DB: its header's change counter
+ * and page count, read through SQLite's own file handle while this
+ * connection's read transaction holds the SHARED lock, so no commit can land
+ * mid-read. Every rollback-mode commit bumps the counter (it is how SQLite
+ * tells other connections their page cache is stale), and switching into or
+ * out of WAL is itself such a commit. That makes the state exact where the
+ * store generation is not: the cross-repo pass writes CROSS_* edges straight
+ * into other projects' published DBs without stamping a generation. A
+ * WAL-mode file is refused — a WAL commit need not touch the header — which
+ * is the state of a published DB after any in-place writer switched it to
+ * WAL; it keeps the SQL path until the next publish seals it again. */
+static bool store_rollback_file_state(cbm_store_t *s, char *out, size_t out_sz) {
+    sqlite3_file *file = NULL;
+    unsigned char hdr[ST_DB_HEADER_LEN];
+    if (sqlite3_file_control(s->db, "main", SQLITE_FCNTL_FILE_POINTER, (void *)&file) !=
+            SQLITE_OK ||
+        !file || !file->pMethods ||
+        file->pMethods->xRead(file, hdr, (int)sizeof(hdr), 0) != SQLITE_OK) {
+        return false;
+    }
+    if (hdr[ST_HDR_WRITE_VERSION] != ST_HDR_ROLLBACK ||
+        hdr[ST_HDR_READ_VERSION] != ST_HDR_ROLLBACK) {
+        return false;
+    }
+    snprintf(out, out_sz, "c%u.p%u", st_be32(hdr + ST_HDR_CHANGE_COUNTER),
+             st_be32(hdr + ST_HDR_PAGE_COUNT));
+    return true;
+}
+
+/* This store's adjacency layer, or NULL for the SQL path; tried once per
+ * store. The layer's version is the store generation plus the file state, and
+ * both — like a miss's edge scan — are read inside one read transaction, so a
+ * layer holds exactly the edges of the version it is keyed to. */
+static cbm_graph_mem_t *store_graph_mem(cbm_store_t *s) {
+    if (s->graph_mem_tried) {
+        return s->graph_mem;
+    }
+    s->graph_mem_tried = true;
+    if (!s->query_store || !s->db || !s->db_path) {
+        return NULL;
+    }
+    bool own_txn = sqlite3_get_autocommit(s->db) != 0;
+    if (own_txn && sqlite3_exec(s->db, "BEGIN DEFERRED;", NULL, NULL, NULL) != SQLITE_OK) {
+        return NULL;
+    }
+    char generation[CBM_SZ_128];
+    char state[CBM_SZ_64];
+    char version[CBM_SZ_256];
+    /* The generation read is the transaction's first read: the SHARED lock
+     * the file-state read relies on is held from here on. */
+    if (cbm_store_generation(s, generation, sizeof(generation)) == CBM_STORE_OK &&
+        strcmp(generation, "legacy") != 0 && store_rollback_file_state(s, state, sizeof(state))) {
+        snprintf(version, sizeof(version), "%s/%s", generation, state);
+        s->graph_mem = cbm_graph_mem_acquire(s->db, s->db_path, version);
+    }
+    if (own_txn) {
+        (void)sqlite3_exec(s->db, "COMMIT;", NULL, NULL, NULL);
+    }
+    if (s->graph_mem &&
+        sqlite3_create_function(s->db, "cbm_adj_degree", ST_COL_2,
+                                SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, s,
+                                sqlite_graph_mem_degree, NULL, NULL) != SQLITE_OK) {
+        cbm_graph_mem_release(s->graph_mem);
+        s->graph_mem = NULL;
+    }
+    if (s->graph_mem) {
+        s->graph_mem_degree_mask =
+            cbm_graph_mem_type_mask(s->graph_mem, st_degree_types,
+                                    (int)(sizeof(st_degree_types) / sizeof(st_degree_types[0])));
+    }
+    return s->graph_mem;
+}
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 /* Convert a glob pattern to SQL LIKE pattern. */
@@ -6403,6 +7052,36 @@ int cbm_extract_like_hints(const char *pattern, char **out, int max_out) {
         out[count++] = strdup(buf);
     }
     return count;
+}
+
+/* Patterns run as POSIX ERE without REG_NEWLINE, so '^' anchors at the start of
+ * the name only, and a pattern without '|' is one concatenation: every match
+ * begins with the literal run after the '^'. A following '*', '?', '{' may
+ * repeat the run's last character zero times and '+' may be combined with them
+ * (glibc reads "a+?" as "(a+)?"), so that character is dropped; so is the one
+ * before a backslash, which no rule here needs to interpret. */
+int cbm_regex_anchored_prefix(const char *pattern, char *out, int out_sz) {
+    if (!pattern || !out || out_sz <= 1 || pattern[0] != '^' || strchr(pattern, '|')) {
+        if (out && out_sz > 0) {
+            out[0] = '\0';
+        }
+        return 0;
+    }
+    int len = 0;
+    const char *p = pattern + SKIP_ONE;
+    while (*p && len < out_sz - SKIP_ONE) {
+        unsigned char c = (unsigned char)*p;
+        if (c < ' ' || c > '~' || strchr(".[]()*+?{}|^$\\", c)) {
+            break;
+        }
+        out[len++] = (char)c;
+        p++;
+    }
+    if (len > 0 && *p && strchr("*+?{\\", *p)) {
+        len--;
+    }
+    out[len] = '\0';
+    return len;
 }
 
 /* ── ensureCaseInsensitive / stripCaseFlag ────────────────────── */
@@ -6701,6 +7380,151 @@ static int search_build_where(const cbm_search_params_t *params, char *where, in
     return nparams;
 }
 
+/* Anchored name patterns ("^schedule$", "^kmalloc"): every matching name begins
+ * with the pattern's literal prefix (cbm_regex_anchored_prefix), so it lies in a
+ * half-open idx_nodes_name range [prefix, prefix with its last byte + 1). Under
+ * iregexp the prefix matches in any letter case: the process never calls
+ * setlocale, so the regex runs in the C locale and folds ASCII letters only, and
+ * each of the first ST_NAME_RANGE_LETTERS letters doubles the ranges. The ranges
+ * are ADDED to the full WHERE (LIKE hints and regex stay), so the rows are those
+ * of the plain query — which instead scans every name of the project. */
+typedef struct {
+    char lo[ST_NAME_RANGE_MAX][ST_NAME_RANGE_PREFIX];
+    char hi[ST_NAME_RANGE_MAX][ST_NAME_RANGE_PREFIX];
+    int count;
+} search_name_ranges_t;
+
+static bool name_range_letter(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static char name_range_case(char c, bool lower) {
+    if (lower && c >= 'A' && c <= 'Z') {
+        return (char)(c - 'A' + 'a');
+    }
+    if (!lower && c >= 'a' && c <= 'z') {
+        return (char)(c - 'a' + 'A');
+    }
+    return c;
+}
+
+static int search_name_ranges(const cbm_search_params_t *p, search_name_ranges_t *r) {
+    r->count = 0;
+    /* Without the project the index cannot seek the name; degree filters wrap
+     * the query in a subselect this rewrite leaves alone. */
+    if (!p->project || !p->name_pattern || p->min_degree >= 0 || p->max_degree >= 0) {
+        return 0;
+    }
+    char prefix[ST_NAME_RANGE_PREFIX];
+    int len = cbm_regex_anchored_prefix(p->name_pattern, prefix, (int)sizeof(prefix));
+    if (len == 0) {
+        return 0;
+    }
+    /* A pattern the regex function rejects fails the plain query once a row
+     * reaches the regex; fewer rows reach it here, so it keeps the plain query. */
+    int flags = CBM_REG_EXTENDED | CBM_REG_NOSUB | (p->case_sensitive ? 0 : CBM_REG_ICASE);
+    cbm_regex_t re;
+    if (cbm_regcomp(&re, p->name_pattern, flags) != 0) {
+        return 0;
+    }
+    cbm_regfree(&re);
+    int letters = 0;
+    if (!p->case_sensitive) {
+        int k = 0;
+        for (; k < len; k++) {
+            if (name_range_letter(prefix[k])) {
+                if (letters == ST_NAME_RANGE_LETTERS) {
+                    break;
+                }
+                letters++;
+            }
+        }
+        len = k;
+    }
+    int variants = SKIP_ONE << letters;
+    for (int v = 0; v < variants; v++) {
+        int bit = letters - SKIP_ONE;
+        for (int i = 0; i < len; i++) {
+            char c = prefix[i];
+            if (!p->case_sensitive && name_range_letter(c)) {
+                /* Variant 0 is all upper case: ranges in ascending byte order. */
+                c = name_range_case(c, ((v >> bit) & SKIP_ONE) != 0);
+                bit--;
+            }
+            r->lo[v][i] = c;
+            r->hi[v][i] = c;
+        }
+        r->lo[v][len] = '\0';
+        r->hi[v][len] = '\0';
+        r->hi[v][len - SKIP_ONE]++; /* printable ASCII: never wraps */
+    }
+    r->count = variants;
+    return variants;
+}
+
+/* Main and count SQL over the name ranges: one UNION ALL arm per range, each
+ * the plain WHERE plus its range, so every arm seeks idx_nodes_name. The arms
+ * are disjoint and each yields (name, id) order, so ORDER BY 4, 1 (n.name,
+ * n.id) merges them without a sort and the per-row degree subqueries run only
+ * for rows the page emits; the count sums the per-range counts. On false
+ * (allocation, bind slots) nothing is bound and the plain query runs. */
+/* Append to buf[0..cap) at *len; false (nothing written past cap) when it
+ * does not fit. */
+static bool search_sql_append(char *buf, size_t cap, size_t *len, const char *fmt, ...) {
+    if (*len >= cap) {
+        return false;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int wrote = vsnprintf(buf + *len, cap - *len, fmt, args);
+    va_end(args);
+    if (wrote < 0 || (size_t)wrote >= cap - *len) {
+        return false;
+    }
+    *len += (size_t)wrote;
+    return true;
+}
+
+static bool search_build_ranged_sql(const char *select_cols, const char *where,
+                                    const search_name_ranges_t *r, int limit, int offset,
+                                    search_bind_t *binds, int *bind_idx, char **out_sql,
+                                    char **out_count_sql) {
+    if (*bind_idx + (r->count * ST_COL_2) > ST_SEARCH_MAX_BINDS) {
+        return false;
+    }
+    size_t cap = (strlen(select_cols) + strlen(where) + ST_NAME_RANGE_ARM_SQL) * (size_t)r->count +
+                 ST_NAME_RANGE_ARM_SQL;
+    char *sql = cbm_alloc(CBM_MEM_CLASS_STORE, cap);
+    char *cnt = cbm_alloc(CBM_MEM_CLASS_STORE, cap);
+    int first_bind = *bind_idx;
+    size_t sl = 0;
+    size_t cl = 0;
+    bool ok = sql && cnt && search_sql_append(cnt, cap, &cl, "SELECT ");
+    for (int i = 0; ok && i < r->count; i++) {
+        int lo = *bind_idx + SKIP_ONE;
+        where_bind_text(binds, bind_idx, r->lo[i]);
+        where_bind_text(binds, bind_idx, r->hi[i]);
+        ok = search_sql_append(sql, cap, &sl,
+                               "%s%s FROM nodes n WHERE (%s) AND n.name >= ?%d AND n.name < ?%d",
+                               i > 0 ? " UNION ALL " : "", select_cols, where, lo, lo + SKIP_ONE) &&
+             search_sql_append(cnt, cap, &cl,
+                               "%s(SELECT COUNT(*) FROM nodes n WHERE (%s) AND n.name >= ?%d AND "
+                               "n.name < ?%d)",
+                               i > 0 ? " + " : "", where, lo, lo + SKIP_ONE);
+    }
+    ok = ok && search_sql_append(sql, cap, &sl, " ORDER BY 4, 1 LIMIT %d OFFSET %d", limit, offset);
+    if (!ok) {
+        /* Nothing is bound: the caller runs the plain query. */
+        *bind_idx = first_bind;
+        cbm_free(CBM_MEM_CLASS_STORE, sql);
+        cbm_free(CBM_MEM_CLASS_STORE, cnt);
+        return false;
+    }
+    *out_sql = sql;
+    *out_count_sql = cnt;
+    return true;
+}
+
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db) {
@@ -6719,6 +7543,16 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
                               "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
                               "'IMPLEMENTS')) AS out_deg ";
+    /* A degree filter evaluates both counts for EVERY candidate row (787k
+     * Functions on the kernel: two B-tree seeks each, 1.9 s per pass). The
+     * adjacency layer answers them from RAM; the query is otherwise the same,
+     * so filter, order, page and total are unchanged. */
+    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
+    if (has_degree_filter && store_graph_mem(s)) {
+        select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                      "n.file_path, n.start_line, n.end_line, n.properties, "
+                      "cbm_adj_degree(n.id, 1) AS in_deg, cbm_adj_degree(n.id, 0) AS out_deg ";
+    }
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -6735,7 +7569,6 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     }
 
     /* Degree filters */
-    bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
     search_apply_degree_filter(sql, sizeof(sql), params);
 
     /* Count query — stripped of per-row edge subqueries for the common (no-degree-filter)
@@ -6761,9 +7594,21 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
              id_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
+    /* Anchored name pattern: the same rows through idx_nodes_name seeks. */
+    search_name_ranges_t name_ranges;
+    char *ranged_sql = NULL;
+    char *ranged_count_sql = NULL;
+    if (nparams > 0 && search_name_ranges(params, &name_ranges) > 0) {
+        (void)search_build_ranged_sql(select_cols, where, &name_ranges, limit, offset, binds,
+                                      &bind_idx, &ranged_sql, &ranged_count_sql);
+    }
+    const char *main_sql = ranged_sql ? ranged_sql : sql;
+    const char *total_sql = ranged_count_sql ? ranged_count_sql : count_sql;
+
     /* Execute count query */
     sqlite3_stmt *cnt_stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db, count_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
+    int rc = sqlite3_prepare_v2(s->db, total_sql, CBM_NOT_FOUND, &cnt_stmt, NULL);
+    cbm_free(CBM_MEM_CLASS_STORE, ranged_count_sql); /* prepare_v2 copies the text */
     if (rc == SQLITE_OK) {
         for (int i = 0; i < bind_idx; i++) {
             bind_text(cnt_stmt, i + SKIP_ONE, binds[i].text);
@@ -6776,7 +7621,8 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     /* Execute main query */
     sqlite3_stmt *main_stmt = NULL;
-    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &main_stmt, NULL);
+    rc = sqlite3_prepare_v2(s->db, main_sql, CBM_NOT_FOUND, &main_stmt, NULL);
+    cbm_free(CBM_MEM_CLASS_STORE, ranged_sql);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "search prepare");
         like_pool_free(&like_pool);
@@ -7011,43 +7857,47 @@ static int bfs_cte_row_limit_for_depth(int max_results, int max_depth) {
     return (int)scaled;
 }
 
-static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
-                     const char **edge_types, int edge_type_count, int max_depth, int max_results,
-                     bool trail, int max_edges, cbm_traverse_result_t *out) {
-    memset(out, 0, sizeof(*out));
-    if (max_results < 0) {
-        max_results = 0;
+/* One store_bfs walk, shared by its SQL and in-memory paths. */
+typedef struct {
+    int64_t start_id;
+    bool inbound;
+    const char *types_clause;
+    const char **edge_types;
+    int edge_type_count;
+    int max_depth;
+    int max_results;
+    int probe_limit; /* max_results + 1: saturation stays observable */
+    bool trail;
+} bfs_query_t;
+
+typedef struct {
+    cbm_node_hop_t *visited;
+    int count;
+    int cap;
+} bfs_rows_t;
+
+static void bfs_rows_init(bfs_rows_t *rows) {
+    rows->cap = ST_INIT_CAP_16;
+    rows->count = 0;
+    rows->visited = malloc(rows->cap * sizeof(cbm_node_hop_t));
+}
+
+static cbm_node_hop_t *bfs_rows_next(bfs_rows_t *rows) {
+    if (rows->count >= rows->cap) {
+        rows->cap *= ST_GROWTH;
+        rows->visited = safe_realloc(rows->visited, rows->cap * sizeof(cbm_node_hop_t));
     }
+    return &rows->visited[rows->count++];
+}
 
-    cbm_node_t root = {0};
-    int rc = cbm_store_find_node_by_id(s, start_id, &root);
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    out->root = root;
-
-    char types_clause[CBM_SZ_512];
-    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
-
-    /* Build recursive CTE for BFS */
+/* The recursive CTE: trail (relationship-unique, for Cypher) or shortest-path. */
+static int bfs_visit_sql(cbm_store_t *s, const bfs_query_t *q, bfs_rows_t *rows, int *cte_rows,
+                         int *cte_row_limit) {
     char sql[CBM_SZ_4K];
-    const char *join_cond;
-    const char *next_id;
-    bool is_inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0);
-
-    if (is_inbound) {
-        join_cond = "e.target_id = bfs.node_id";
-        next_id = "e.source_id";
-    } else {
-        join_cond = "e.source_id = bfs.node_id";
-        next_id = "e.target_id";
-    }
-
-    /* One extra row makes max_results saturation observable on both branches. */
-    int probe_limit = max_results < INT_MAX ? max_results + SKIP_ONE : max_results;
-    int cte_row_limit = 0;
-    if (trail) {
-        cte_row_limit = bfs_cte_row_limit_for_depth(max_results, max_depth);
+    const char *join_cond = q->inbound ? "e.target_id = bfs.node_id" : "e.source_id = bfs.node_id";
+    const char *next_id = q->inbound ? "e.source_id" : "e.target_id";
+    if (q->trail) {
+        *cte_row_limit = bfs_cte_row_limit_for_depth(q->max_results, q->max_depth);
         snprintf(sql, sizeof(sql),
                  "WITH RECURSIVE bfs(node_id, hop, edge_path) AS ("
                  "  SELECT %lld, 0, ''"
@@ -7072,8 +7922,8 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "(SELECT count(*) FROM bfs) "
                  "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
                  "WHERE bfs.hop > 0 ORDER BY bfs.hop, n.id LIMIT %d;",
-                 (long long)start_id, next_id, join_cond, types_clause, max_depth,
-                 cte_row_limit + SKIP_ONE, probe_limit);
+                 (long long)q->start_id, next_id, join_cond, q->types_clause, q->max_depth,
+                 *cte_row_limit + SKIP_ONE, q->probe_limit);
     } else {
         snprintf(sql, sizeof(sql),
                  /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) pairs.
@@ -7096,52 +7946,130 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "GROUP BY n.id "
                  "ORDER BY hop, n.id "
                  "LIMIT %d;",
-                 (long long)start_id, next_id, join_cond, types_clause, max_depth, probe_limit);
+                 (long long)q->start_id, next_id, join_cond, q->types_clause, q->max_depth,
+                 q->probe_limit);
     }
 
     sqlite3_stmt *stmt = NULL;
-    rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "bfs prepare");
         return CBM_STORE_ERR;
     }
 
     /* Bind edge type parameters */
-    if (edge_type_count > 0) {
-        for (int i = 0; i < edge_type_count; i++) {
-            bind_text(stmt, i + SKIP_ONE, edge_types[i]);
+    if (q->edge_type_count > 0) {
+        for (int i = 0; i < q->edge_type_count; i++) {
+            bind_text(stmt, i + SKIP_ONE, q->edge_types[i]);
         }
     } else {
         bind_text(stmt, SKIP_ONE, "CALLS");
     }
 
-    int cap = ST_INIT_CAP_16;
-    int n = 0;
-    int cte_rows = 0;
-    cbm_node_hop_t *visited = malloc(cap * sizeof(cbm_node_hop_t));
-
+    bfs_rows_init(rows);
     int scan_rc15;
     while ((scan_rc15 = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (n >= cap) {
-            cap *= ST_GROWTH;
-            visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
+        cbm_node_hop_t *row = bfs_rows_next(rows);
+        scan_node(stmt, &row->node);
+        row->hop = sqlite3_column_int(stmt, ST_COL_9);
+        if (q->trail) {
+            *cte_rows = sqlite3_column_int(stmt, ST_COL_10);
         }
-        scan_node(stmt, &visited[n].node);
-        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
-        if (trail) {
-            cte_rows = sqlite3_column_int(stmt, ST_COL_10);
-        }
-        n++;
     }
     if (scan_rc15 != SQLITE_DONE) { /* SCANCHK:15:stmt */
         store_set_error_sqlite(s, "row scan aborted");
         sqlite3_finalize(stmt);
-        out->visited = visited;
-        out->visited_count = n;
         return CBM_STORE_ERR;
     }
-
     sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+/* The shortest-path walk from the adjacency layer: the same rows as the CTE's
+ * JOIN nodes + ORDER BY hop, n.id + LIMIT, because cbm_graph_mem_bfs yields
+ * every reached id at its minimal hop in (hop, id) order and the node rows are
+ * read here in that order. An id with no node row is skipped, as the JOIN
+ * skips it. */
+static int bfs_visit_mem(cbm_store_t *s, const cbm_graph_mem_t *gm, const bfs_query_t *q,
+                         bfs_rows_t *rows) {
+    static const char *const calls_only[] = {"CALLS"};
+    bool typed = q->edge_type_count > 0;
+    cbm_graph_mem_types_t mask = cbm_graph_mem_type_mask(gm, typed ? q->edge_types : calls_only,
+                                                         typed ? q->edge_type_count : SKIP_ONE);
+    cbm_graph_mem_hop_t *hops = NULL;
+    int hop_count = 0;
+    if (!cbm_graph_mem_bfs(gm, q->start_id, q->inbound, mask, q->max_depth, &hops, &hop_count)) {
+        store_set_error(s, "bfs: adjacency walk out of memory");
+        return CBM_STORE_ERR;
+    }
+    bfs_rows_init(rows);
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < hop_count && rows->count < q->probe_limit && rc == CBM_STORE_OK; i++) {
+        sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_node_by_id, st_find_node_by_id_sql);
+        if (!stmt) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        sqlite3_bind_int64(stmt, SKIP_ONE, hops[i].id);
+        int step = sqlite3_step(stmt);
+        if (step == SQLITE_ROW) {
+            cbm_node_hop_t *row = bfs_rows_next(rows);
+            scan_node(stmt, &row->node);
+            row->hop = hops[i].hop;
+        } else if (step != SQLITE_DONE) {
+            store_set_error_sqlite(s, "bfs node row");
+            rc = CBM_STORE_ERR;
+        }
+        sqlite3_reset(stmt);
+    }
+    cbm_graph_mem_hops_free(hops);
+    return rc;
+}
+
+static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
+                     const char **edge_types, int edge_type_count, int max_depth, int max_results,
+                     bool trail, int max_edges, cbm_traverse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (max_results < 0) {
+        max_results = 0;
+    }
+
+    cbm_node_t root = {0};
+    int rc = cbm_store_find_node_by_id(s, start_id, &root);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    out->root = root;
+
+    char types_clause[CBM_SZ_512];
+    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
+
+    bfs_query_t q = {
+        .start_id = start_id,
+        .inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0),
+        .types_clause = types_clause,
+        .edge_types = edge_types,
+        .edge_type_count = edge_type_count,
+        .max_depth = max_depth,
+        .max_results = max_results,
+        /* One extra row makes max_results saturation observable on both branches. */
+        .probe_limit = max_results < INT_MAX ? max_results + SKIP_ONE : max_results,
+        .trail = trail,
+    };
+    bfs_rows_t rows = {0};
+    int cte_rows = 0;
+    int cte_row_limit = 0;
+    /* A shortest-path walk is answered from the adjacency layer when this
+     * store has one; trail mode keeps its relationship-unique CTE. */
+    cbm_graph_mem_t *gm = trail ? NULL : store_graph_mem(s);
+    rc = gm ? bfs_visit_mem(s, gm, &q, &rows)
+            : bfs_visit_sql(s, &q, &rows, &cte_rows, &cte_row_limit);
+    cbm_node_hop_t *visited = rows.visited;
+    int n = rows.count;
+    if (rc != CBM_STORE_OK) {
+        out->visited = visited;
+        out->visited_count = n;
+        return rc;
+    }
 
     if (trail && cte_rows > cte_row_limit) {
         out->truncated = true;
@@ -7629,6 +8557,25 @@ int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char
     return n;
 }
 
+/* Per-label and per-type counts. GROUP BY over the (project, label) index
+ * decodes every entry to compare its group key; stepping through the distinct
+ * values with MIN(col) > previous seeks and counting each value's index range
+ * is ~1.6x faster (kernel, 8.5M nodes: 0.26 -> 0.16 s; 16.9M edges: 0.54 ->
+ * 0.32 s). The values reach ORDER BY in the ascending order GROUP BY emitted
+ * them in, so tied counts keep their order. label and type are NOT NULL. */
+static const char ST_LABEL_COUNTS_SQL[] =
+    "WITH RECURSIVE v(x) AS (SELECT MIN(label) FROM nodes WHERE project = ?1 UNION ALL "
+    "SELECT (SELECT MIN(label) FROM nodes WHERE project = ?1 AND label > v.x) FROM v "
+    "WHERE v.x IS NOT NULL) "
+    "SELECT x, (SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = v.x) AS c "
+    "FROM v WHERE x IS NOT NULL ORDER BY c DESC;";
+static const char ST_TYPE_COUNTS_SQL[] =
+    "WITH RECURSIVE v(x) AS (SELECT MIN(type) FROM edges WHERE project = ?1 UNION ALL "
+    "SELECT (SELECT MIN(type) FROM edges WHERE project = ?1 AND type > v.x) FROM v "
+    "WHERE v.x IS NOT NULL) "
+    "SELECT x, (SELECT COUNT(*) FROM edges WHERE project = ?1 AND type = v.x) AS c "
+    "FROM v WHERE x IS NOT NULL ORDER BY c DESC;";
+
 /* with_props=false skips the per-label/per-type JSON property-key discovery:
  * those json_each() scans walk EVERY row of each label/type (minutes-scale on
  * multi-million-node graphs) and get_architecture only needs the counts. */
@@ -7641,8 +8588,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Node labels */
     {
-        const char *sql = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 GROUP BY label "
-                          "ORDER BY COUNT(*) DESC;";
+        const char *sql = ST_LABEL_COUNTS_SQL;
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -7714,8 +8660,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Edge types */
     {
-        const char *sql = "SELECT type, COUNT(*) FROM edges WHERE project = ?1 GROUP BY type ORDER "
-                          "BY COUNT(*) DESC;";
+        const char *sql = ST_TYPE_COUNTS_SQL;
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -8686,15 +9631,24 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
     char like[CBM_SZ_512];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
+    /* GROUP BY +n.name, not n.name: with a bare column the planner walks
+     * idx_nodes_name over EVERY node of the project to get groups in name order,
+     * with a table lookup per node to test the label (6.3 s on the 8.5M-node
+     * kernel graph, for 5 Package nodes). The unary plus keeps the value and its
+     * BINARY collation but not the index, so the rows come from the
+     * idx_nodes_label seek. The ORDER BY sorter keeps tied counts in group
+     * emission order, which was name order from the index; a sorted GROUP BY
+     * follows the ORDER BY direction instead, so the name tie-break is explicit. */
     const char *base = "SELECT n.name, COUNT(*) as cnt FROM nodes n "
                        "WHERE n.project=?1 AND n.label='Package'";
     if (scoped) {
         snprintf(sqlbuf, sizeof(sqlbuf),
                  "%s AND (n.file_path = ?2 OR n.file_path LIKE ?3) "
-                 "GROUP BY n.name ORDER BY cnt DESC LIMIT 15",
+                 "GROUP BY +n.name ORDER BY cnt DESC, +n.name LIMIT 15",
                  base);
     } else {
-        snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY n.name ORDER BY cnt DESC LIMIT 15", base);
+        snprintf(sqlbuf, sizeof(sqlbuf), "%s GROUP BY +n.name ORDER BY cnt DESC, +n.name LIMIT 15",
+                 base);
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
@@ -9738,6 +10692,10 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count) {
     return cbm_leiden(nodes, node_count, edges, edge_count, 1.0, out, out_count);
+}
+
+void cbm_leiden_free(cbm_louvain_result_t *result) {
+    cbm_free(CBM_MEM_CLASS_OTHER, result); /* cbm_leiden allocates OTHER */
 }
 
 /* ── Architecture: community clusters via Leiden ───────────────── */
@@ -10986,7 +11944,260 @@ void cbm_adr_sections_free(cbm_adr_sections_t *s) {
     memset(s, 0, sizeof(*s));
 }
 
+/* ── ADR sidecar store ──────────────────────────────────────────────
+ * ADRs are kept in a per-project sidecar SQLite DB ("<graph_db>.adr.db"), so a
+ * reindex that deletes/replaces the graph DB never disturbs them (no capture,
+ * re-read or re-apply, no lock). adr_conn() returns the connection ADR ops run
+ * on: the sidecar for a file-backed store (opened, schema-created and migrated
+ * once, then cached), or the graph DB for a :memory: store (never file-swapped,
+ * so there is no race to avoid there). */
+
+/* The sidecar's on-disk path ("<db_path>.adr.db"), routed through
+ * cbm_path_for_file_api so a long path gets the Windows \\?\ prefix (like
+ * store_open_internal). Returns false for a :memory: store or an over-long
+ * path. `raw` receives the plain path for existence checks/unlinks; `api`
+ * receives the file-API form used to open. */
+static bool adr_sidecar_path(const cbm_store_t *s, char *raw, size_t raw_sz, char *api,
+                             size_t api_sz) {
+    if (!s->db_path) {
+        return false;
+    }
+    int n = snprintf(raw, raw_sz, "%s.adr.db", s->db_path);
+    if (n <= 0 || (size_t)n >= raw_sz) {
+        return false;
+    }
+    return cbm_path_for_file_api(raw, api, api_sz);
+}
+
+/* Match the graph store's locking so cross-process ADR access waits rather than
+ * failing: WAL + a 10 s busy timeout (SQLite's own lock wait, not a hand-rolled
+ * poll). Best-effort: a read-only sidecar rejects journal_mode, which is fine. */
+static void adr_configure(sqlite3 *db) {
+    (void)sqlite3_exec(db, "PRAGMA busy_timeout = 10000;", NULL, NULL, NULL);
+    (void)sqlite3_exec(db, "PRAGMA journal_mode = WAL;", NULL, NULL, NULL);
+}
+
+static int adr_ensure_schema(sqlite3 *db) {
+    /* project_summaries has the same shape as the graph DB's, so migration is a
+     * plain row copy and the cbm_adr_t mapping is unchanged. adr_meta carries a
+     * one-time "migrated" marker so the legacy copy runs exactly once and can
+     * never resurrect a row deleted after migration. */
+    int rc = sqlite3_exec(db,
+                          "CREATE TABLE IF NOT EXISTS project_summaries ("
+                          "  project TEXT PRIMARY KEY,"
+                          "  summary TEXT NOT NULL,"
+                          "  source_hash TEXT NOT NULL,"
+                          "  created_at TEXT NOT NULL,"
+                          "  updated_at TEXT NOT NULL"
+                          ");"
+                          "CREATE TABLE IF NOT EXISTS adr_meta ("
+                          "  key TEXT PRIMARY KEY,"
+                          "  value TEXT NOT NULL"
+                          ");",
+                          NULL, NULL, NULL);
+    return (rc == SQLITE_OK) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+/* True once the one-time legacy migration has been recorded in the sidecar. */
+static bool adr_migrated(sqlite3 *adb) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(adb, "SELECT 1 FROM adr_meta WHERE key='migrated' LIMIT 1;",
+                           CBM_NOT_FOUND, &st, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool done = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return done;
+}
+
+/* Copy every ADR row from the graph DB's project_summaries into the sidecar with
+ * INSERT OR IGNORE (so a row already present locally is never overwritten). Must
+ * run inside a transaction on the sidecar connection. Returns OK/ERR; does not
+ * touch the `migrated` marker. */
+static int adr_copy_rows(cbm_store_t *s, sqlite3 *adb) {
+    sqlite3_stmt *probe = NULL;
+    if (sqlite3_prepare_v2(
+            s->db,
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
+            CBM_NOT_FOUND, &probe, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bool has_legacy = sqlite3_step(probe) == SQLITE_ROW;
+    sqlite3_finalize(probe);
+    if (!has_legacy) {
+        return CBM_STORE_OK; /* no source table -> nothing to copy */
+    }
+
+    sqlite3_stmt *sel = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT project, summary, source_hash, created_at, updated_at "
+                           "FROM project_summaries;",
+                           CBM_NOT_FOUND, &sel, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(adb,
+                           "INSERT OR IGNORE INTO project_summaries "
+                           "(project, summary, source_hash, created_at, updated_at) "
+                           "VALUES (?1, ?2, ?3, ?4, ?5);",
+                           CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+        sqlite3_finalize(sel);
+        return CBM_STORE_ERR;
+    }
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+        for (int c = 0; c < ST_COL_5; c++) {
+            bind_text(ins, c + 1, (const char *)sqlite3_column_text(sel, c));
+        }
+        int irc = sqlite3_step(ins);
+        sqlite3_reset(ins);
+        sqlite3_clear_bindings(ins);
+        if (irc != SQLITE_DONE) {
+            sqlite3_finalize(sel);
+            sqlite3_finalize(ins);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(sel);
+    sqlite3_finalize(ins);
+    return (rc == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+/* Copy any legacy ADR rows from the graph DB's project_summaries into the
+ * sidecar (INSERT OR IGNORE, so a local row is never clobbered), then set the
+ * one-time marker. The marker check, copy and marker insert run in ONE
+ * BEGIN IMMEDIATE transaction on the sidecar, so two processes migrating at
+ * once cannot re-copy a row the other just deleted. Returns CBM_STORE_ERR on
+ * any failure (transaction rolled back) so callers can fail closed and preserve
+ * the old generation. No-op once the marker is set. */
+static int adr_copy_legacy_once(cbm_store_t *s, sqlite3 *adb) {
+    if (adr_migrated(adb)) {
+        return CBM_STORE_OK; /* fast path: already migrated, no lock needed */
+    }
+    if (sqlite3_exec(adb, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    /* Re-check under the write lock: another process may have migrated between
+     * the fast-path check and acquiring the lock. */
+    if (adr_migrated(adb)) {
+        (void)sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL);
+        return CBM_STORE_OK;
+    }
+    if (adr_copy_rows(s, adb) != CBM_STORE_OK) {
+        goto fail;
+    }
+    if (sqlite3_exec(adb, "INSERT OR IGNORE INTO adr_meta (key, value) VALUES ('migrated','1');",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        goto fail;
+    }
+    if (sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        goto fail;
+    }
+    return CBM_STORE_OK;
+
+fail:
+    (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
+    return CBM_STORE_ERR;
+}
+
+/* Restore ADRs from the graph DB into the sidecar for any project the sidecar has
+ * no row for, WITHOUT overwriting a local one, regardless of the `migrated`
+ * marker. This is what import needs: an artifact carries its ADR in the graph
+ * DB's project_summaries, and a teammate who already indexed the project (so the
+ * sidecar is marked, but has no ADR) must still receive it. INSERT OR IGNORE
+ * guarantees a local ADR is never clobbered; running ungated by the marker is
+ * what distinguishes this from the one-time legacy migration. It never writes
+ * the marker: `adb` comes from adr_conn_write, which hands out a sidecar handle
+ * only after adr_copy_legacy_once committed it, and nothing deletes it. On
+ * failure the store error names the step (the import logs it). */
+static int adr_restore_if_absent(cbm_store_t *s, sqlite3 *adb) {
+    if (sqlite3_exec(adb, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr restore begin");
+        return CBM_STORE_ERR;
+    }
+    if (adr_copy_rows(s, adb) != CBM_STORE_OK) {
+        store_set_error(s, "adr restore copy failed");
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr restore commit");
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+/* Open (create) the read-write sidecar, configure locking, ensure the schema,
+ * run the one-time legacy migration, and cache the handle. NULL + error set on
+ * failure (fail closed). :memory: stores return the graph DB (no race there). */
+static sqlite3 *adr_conn_write(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return NULL;
+    }
+    if (!s->db_path) {
+        return s->db; /* :memory: store — ADRs stay in the graph DB */
+    }
+    if (s->adr_db) {
+        return s->adr_db;
+    }
+    char raw[4096];
+    char api[4096];
+    if (!adr_sidecar_path(s, raw, sizeof(raw), api, sizeof(api))) {
+        store_set_error(s, "adr sidecar path too long");
+        return NULL;
+    }
+    sqlite3 *adb = NULL;
+    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    if (sqlite3_open_v2(api, &adb, flags, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr sidecar open");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    adr_configure(adb);
+    if (adr_ensure_schema(adb) != CBM_STORE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr sidecar schema");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    if (adr_copy_legacy_once(s, adb) != CBM_STORE_OK) {
+        store_set_error(s, "adr sidecar legacy migration failed");
+        sqlite3_close_v2(adb);
+        return NULL;
+    }
+    s->adr_db = adb;
+    return s->adr_db;
+}
+
+int cbm_store_adr_migrate_once(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    if (!s->db_path) {
+        return CBM_STORE_OK; /* :memory: — ADRs already in the graph DB, nothing to move */
+    }
+    return adr_conn_write(s) ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_store_adr_restore_from_graph_if_absent(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    if (!s->db_path) {
+        return CBM_STORE_OK; /* :memory: — ADR already lives in the graph DB */
+    }
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
+    return adr_restore_if_absent(s, adb);
+}
+
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content) {
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
     char now[CBM_SZ_32];
     iso_now(now, sizeof(now));
 
@@ -10996,8 +12207,8 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
         "ON CONFLICT(project) DO UPDATE SET summary=excluded.summary, "
         "updated_at=excluded.updated_at";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_store");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_store");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
@@ -11009,22 +12220,17 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
     return (rc == SQLITE_DONE) ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
-int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
-    if (!s || !s->db || !project || !out) {
-        return CBM_STORE_ERR;
-    }
-    memset(out, 0, sizeof(*out));
-
-    /* ADR storage was added after the original graph schema. A readable
-     * legacy generation without project_summaries has no ADR to preserve; it
-     * is not a read failure and must remain replaceable by a full reindex. */
+/* Read one ADR row from an already-open connection into `out`. Returns
+ * CBM_STORE_OK / CBM_STORE_NOT_FOUND / CBM_STORE_ERR. Never writes. */
+static int adr_read_row(cbm_store_t *s, sqlite3 *adb, const char *project, cbm_adr_t *out) {
+    /* A readable legacy generation without project_summaries has no ADR; that is
+     * NOT_FOUND, not a read failure. */
     sqlite3_stmt *table_stmt = NULL;
     int rc = sqlite3_prepare_v2(
-        s->db,
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
+        adb, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
         CBM_NOT_FOUND, &table_stmt, NULL);
     if (rc != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get table probe");
+        store_set_error_sqlite_on(s, adb, "adr_get table probe");
         return CBM_STORE_ERR;
     }
     rc = sqlite3_step(table_stmt);
@@ -11033,26 +12239,26 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
         return CBM_STORE_NOT_FOUND;
     }
     if (rc != SQLITE_ROW || sqlite3_finalize(table_stmt) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get table probe step");
+        store_set_error_sqlite_on(s, adb, "adr_get table probe step");
         return CBM_STORE_ERR;
     }
 
     const char *sql = "SELECT project, summary, created_at, updated_at FROM project_summaries "
                       "WHERE project=?1";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_get");
         return CBM_STORE_ERR;
     }
     if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_get bind");
+        store_set_error_sqlite_on(s, adb, "adr_get bind");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
         if (rc != SQLITE_DONE) {
-            store_set_error_sqlite(s, "adr_get step");
+            store_set_error_sqlite_on(s, adb, "adr_get step");
         }
         sqlite3_finalize(stmt);
         if (rc == SQLITE_DONE) {
@@ -11068,13 +12274,11 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
     rc = sqlite3_finalize(stmt);
     if (rc != SQLITE_OK) {
         cbm_store_adr_free(out);
-        store_set_error_sqlite(s, "adr_get finalize");
+        store_set_error_sqlite_on(s, adb, "adr_get finalize");
         return CBM_STORE_ERR;
     }
-
-    /* Every selected column is NOT NULL in the schema. A NULL here therefore
-     * means either allocation failure or corrupt data; never return a partial
-     * ADR that a full rebuild could silently drop during publication. */
+    /* Every selected column is NOT NULL in the schema. A NULL here means an
+     * allocation failure or corruption; never return a partial ADR. */
     if (!out->project || !out->content || !out->created_at || !out->updated_at) {
         cbm_store_adr_free(out);
         store_set_error(s, "adr_get: failed to copy complete ADR");
@@ -11083,16 +12287,62 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
     return CBM_STORE_OK;
 }
 
+int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
+    if (!s || !s->db || !project || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* :memory: store, or a sidecar already open read-write: read it directly. */
+    if (!s->db_path) {
+        return adr_read_row(s, s->db, project, out);
+    }
+    if (s->adr_db) {
+        return adr_read_row(s, s->adr_db, project, out);
+    }
+
+    /* A read must never create the sidecar (a query-only cache may be
+     * read-only): open it READONLY if the file exists, otherwise read the
+     * legacy row from the graph DB without migrating. */
+    char raw[4096];
+    char api[4096];
+    if (adr_sidecar_path(s, raw, sizeof(raw), api, sizeof(api)) && cbm_file_exists(raw)) {
+        sqlite3 *ro = NULL;
+        if (sqlite3_open_v2(api, &ro, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+            store_set_error_sqlite_on(s, ro, "adr sidecar open (ro)");
+            sqlite3_close_v2(ro);
+            return CBM_STORE_ERR;
+        }
+        (void)sqlite3_exec(ro, "PRAGMA busy_timeout = 10000;", NULL, NULL, NULL);
+        /* A sidecar that exists but was never marked migrated is half-created:
+         * the legacy copy did not commit, so the ADR (if any) still lives only
+         * in the graph DB. Fall back to the graph row so a partial sidecar never
+         * hides an existing ADR. */
+        if (!adr_migrated(ro)) {
+            sqlite3_close_v2(ro);
+            return adr_read_row(s, s->db, project, out);
+        }
+        int rc = adr_read_row(s, ro, project, out);
+        sqlite3_close_v2(ro);
+        return rc;
+    }
+    return adr_read_row(s, s->db, project, out);
+}
+
 int cbm_store_adr_delete(cbm_store_t *s, const char *project) {
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
     const char *sql = "DELETE FROM project_summaries WHERE project=?1";
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "adr_delete");
+    if (sqlite3_prepare_v2(adb, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_delete");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
     int rc = sqlite3_step(stmt);
-    int changes = sqlite3_changes(s->db);
+    int changes = sqlite3_changes(adb);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
         return CBM_STORE_ERR;
@@ -11110,13 +12360,20 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
         return CBM_STORE_ERR;
     }
 
-    /* The read-modify-write below must be ONE transaction. Three writers
-     * replace this row wholesale — the indexing pipeline, the UI POST
-     * /api/adr handler, and manage_adr mode='update' — so an unguarded
-     * get/merge/store silently loses whichever of them commits between the
-     * read and the UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a
-     * competing writer waits rather than being overwritten. */
-    if (cbm_store_begin(s) != CBM_STORE_OK) {
+    /* The read-modify-write below must be ONE transaction, and it runs on the
+     * ADR connection (the sidecar for a file store, the graph DB for :memory:)
+     * — the same connection cbm_store_adr_get/store use, so the write lock
+     * actually covers them. Two writers replace this row wholesale — the UI
+     * POST /api/adr handler and manage_adr mode='update' — so an unguarded
+     * get/merge/store silently loses whichever commits between the read and the
+     * UPSERT. BEGIN IMMEDIATE takes the write lock up front, so a competing
+     * writer waits rather than being overwritten. */
+    sqlite3 *adb = adr_conn_write(s);
+    if (!adb) {
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_exec(adb, "BEGIN IMMEDIATE;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_update begin");
         return CBM_STORE_ERR;
     }
 
@@ -11124,7 +12381,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     cbm_adr_t existing;
     int rc = cbm_store_adr_get(s, project, &existing);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, "no existing ADR to update");
         return rc;
     }
@@ -11139,7 +12396,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     if (cbm_adr_check_structure(existing.content, structure_err, (int)sizeof(structure_err)) !=
         CBM_STORE_OK) {
         cbm_store_adr_free(&existing);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, structure_err);
         return CBM_STORE_ERR;
     }
@@ -11153,7 +12410,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     }
 
     if (!merged) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, "failed to splice ADR section");
         return CBM_STORE_ERR;
     }
@@ -11164,7 +12421,7 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
         snprintf(msg, sizeof(msg), "merged ADR exceeds %d chars (%d chars)", CBM_ADR_MAX_LENGTH,
                  (int)strlen(merged));
         free(merged);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         store_set_error(s, msg);
         return CBM_STORE_ERR;
     }
@@ -11173,19 +12430,20 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     rc = cbm_store_adr_store(s, project, merged);
     free(merged);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return rc;
     }
 
     /* Read back INSIDE the transaction so `out` is exactly what commits. */
     rc = cbm_store_adr_get(s, project, out);
     if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return rc;
     }
-    if (cbm_store_commit(s) != CBM_STORE_OK) {
+    if (sqlite3_exec(adb, "COMMIT;", NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite_on(s, adb, "adr_update commit");
         cbm_store_adr_free(out);
-        (void)cbm_store_rollback(s);
+        (void)sqlite3_exec(adb, "ROLLBACK;", NULL, NULL, NULL);
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;

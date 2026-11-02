@@ -289,8 +289,9 @@ typedef struct {
      * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
      * Always 0 until a language enables its callable_identity mode. */
     uint32_t qn_sig_off;
-    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
-     * the global namespace and every other language). Per type, because the
+    /* C# only: declared namespace of a TOP-LEVEL type, "" for the global
+     * namespace (proven only by a clean parse), NULL for nested types, an
+     * unknown namespace and every other language. Per type, because the
      * file-level namespace_name records only a file's first namespace. */
     const char *decl_namespace;
     CBMTestDefinitionRole test_role; /* NONE preserves legacy helper/test-file semantics */
@@ -298,9 +299,10 @@ typedef struct {
      * are bound to the owning result's source identity before cross-file use. */
     uint32_t test_name_start_byte, test_name_end_byte;
     uint32_t test_body_start_byte, test_body_end_byte;
-    /* Documents only: facts a document definition adds to its node's
-     * properties, as a NULL-terminated key, value, key, value, ... list (an
-     * ADR's id, status, date, deciders, title). Keys are fixed literals; the
+    /* Facts a definition adds to its node's properties, as a NULL-terminated
+     * key, value, key, value, ... list: a document's (an ADR's id, status,
+     * date, deciders, title), or CBM_PROP_GENERATED on a member the compiler
+     * writes and the source never spells. Keys are fixed literals; the
      * values are escaped where the properties are written. Tail field:
      * zero-init stays valid. */
     const char **extra_props;
@@ -313,7 +315,20 @@ typedef struct {
      * change of all, store_impact.h follow_variant_keys). NULL on every other
      * definition. Tail field: zero-init stays valid. */
     const char *variant_key;
+    /* Go only (#2033): the raw aliased type text of an identity alias
+     * `type A = B` ("B"). Carried to the cross-file registries so a method
+     * call on A from another file follows the alias to B's method set. NULL
+     * for a defined type `type A B` (its method set is its own) and in every
+     * other language. Tail field: zero-init stays valid. */
+    const char *alias_target;
 } CBMDefinition;
+
+/* extra_props key of a generated member, one the compiler writes and the
+ * source never spells: a Java record's implicit accessor carries
+ * `generated: record`. The node keeps the property, and the pipeline registers
+ * such a definition by qualified name only, so no short-name guess can land on
+ * it (pipeline.h cbm_def_props_generated). */
+#define CBM_PROP_GENERATED "generated"
 
 /* Argument captured from a call expression */
 typedef struct {
@@ -398,11 +413,26 @@ typedef struct {
     const char *member;      // ES named import: the exported name the local binds (`get` in
                              // `import { get as navigate } from "axios"`); NULL otherwise
     bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
+    bool type_checking_only; // Python: inside a module-level `if TYPE_CHECKING:` block --
+                             // binds the name for annotations, never at runtime (#1277)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 
-/* Content-only ordered Python namespace facts; no resolved target identities. */
-#define CBM_PY_NAMESPACE_FACTS_VERSION 1u
+/* True when an import binds its local name at runtime. A Python import under
+ * `if TYPE_CHECKING:` exists for annotations only: a call through that name
+ * cannot happen, so no CALLS import map may bind it (an import_map edge
+ * through it would be fabricated by construction). THE one rule every CALLS
+ * import-map builder applies. */
+static inline bool cbm_import_binds_runtime_name(const CBMImport *imp) {
+    return imp && !imp->type_checking_only;
+}
+
+/* Content-only ordered Python namespace facts; no resolved target identities.
+ * The version travels in the lsp_surface "py" payload, and a stored payload of
+ * another version does not decode: an incremental run then re-extracts in full,
+ * so stored facts of an older extraction never mix with fresh ones.
+ * 2: string-literal statements are no effect; `from __future__` imports bind. */
+#define CBM_PY_NAMESPACE_FACTS_VERSION 2u
 
 typedef enum {
     CBM_PY_NS_NOT_CAPTURED = 0,
@@ -719,7 +749,9 @@ typedef struct {
  *     from the URL `name`; a HelmRelease whose chartRef names it deploys the
  *     chart there.
  *   CBM_K8S_FACT_IMAGE: object def_index runs its container `container`
- *     (NULL: unnamed) from image `name` (a literal reference); via "container".
+ *     (NULL: unnamed) from image `name` (a literal reference, or a Helm
+ *     template's placeholder `<...>`, which names none); via "container";
+ *     `line` the image's line, start_line / end_line the container's.
  *   CBM_K8S_FACT_ENV: object def_index sets environment variable `name` in
  *     its container `container` (NULL: unnamed) at `line`; via = where the
  *     value comes from ("value", or the valueFrom kind) -- never the value.
@@ -758,6 +790,8 @@ typedef struct {
     const char *url;      /* DEPLOY (kustomize): the chart repository */
     const char *release;  /* DEPLOY (kustomize): the release name */
     int line;
+    int start_line; /* IMAGE: the container mapping's first line */
+    int end_line;   /* IMAGE: its last line */
 } CBMK8sFact;
 
 typedef struct {
@@ -830,6 +864,8 @@ typedef struct {
 typedef struct CBMFileResult {
     CBMArena arena; // owns local memory; composites may also retain child arenas below
 
+    uint64_t markdown_collection_steps; // collector cursor moves/node visits, not parser internals
+    uint64_t markdown_name_checks;      // heading-name lookup/group checks, excluding sorting
     CBMDefArray defs;
     CBMCallArray calls;
     CBMImportArray imports;
@@ -1041,6 +1077,9 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Markdown: the settled names of the file's headings (extract_defs.c),
+     * NULL until the first heading; allocated in `scratch`. */
+    void *md_headings;
     const cbm_test_declarations_t *test_declarations; /* borrowed for this call only */
     bool test_declarations_raw_source;
     struct CBMTestDefinitionMatch *test_definition_matches; /* traversal scratch */
@@ -1306,6 +1345,14 @@ void cbm_py_namespace_test_copy_fail_after(int successful_allocations);
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);
 void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp);
+/* True unless every import of `imports` that binds `local_name` is
+ * annotation-only (cbm_import_binds_runtime_name), so also true when no import
+ * names it: the rule for the builders that key IMPORTS edges by local name. */
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name);
+/* The same for the `len` bytes at `name` (not NUL-terminated): lets a caller
+ * decide before it copies the name. */
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len);
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage);
 void cbm_throws_push(CBMThrowArray *arr, CBMArena *a, CBMThrow thr);
 void cbm_rw_push(CBMRWArray *arr, CBMArena *a, CBMReadWrite rw);
@@ -1361,6 +1408,11 @@ void cbm_extract_diagram_file(CBMExtractCtx *ctx);
  * a doc link per operationId. Self-gated: openapi.json / swagger.json, and YAML
  * or JSON files whose root says `openapi` or `swagger`. */
 void cbm_extract_openapi(CBMExtractCtx *ctx);
+
+/* Next.js App Router route handlers (extract_nextjs.c): the HTTP verb Functions
+ * a route file exports carry the route path its directories name. Self-gated:
+ * TS / JS route.ts and route.js under app/ or src/app/. */
+void cbm_extract_nextjs_routes(CBMExtractCtx *ctx);
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites, server handlers

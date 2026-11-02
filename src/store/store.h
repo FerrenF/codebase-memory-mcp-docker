@@ -29,8 +29,13 @@ typedef struct cbm_store_read_scope cbm_store_read_scope_t;
  *   1  #1108: File-node QNs keep the file extension.
  *   2  Kubernetes objects: one Resource per YAML document, QN
  *      <file>::<group>/<Kind>/<declared namespace or ->/<name>; a
- *      Dockerfile.<variant> keeps its suffix in its QNs. */
-#define CBM_INDEX_FORMAT_VERSION 2
+ *      Dockerfile.<variant> keeps its suffix in its QNs.
+ *   3  Image identity invents no registry: a reference without a host is
+ *      __image__<repository as written>, registry "unknown" -- no longer
+ *      __image__docker.io/[library/]<repository>.
+ *   4  #1913: Go method QNs are receiver-qualified (pkg.Recv.method, generic
+ *      receivers unwrapped); free functions stay pkg.func. */
+#define CBM_INDEX_FORMAT_VERSION 4
 #define CBM_STORE_CANCELLED (-3)
 #define CBM_STORE_SCAN_LIMIT (-4)
 #define CBM_STORE_CALLBACK_ERR (-5)
@@ -478,6 +483,16 @@ int cbm_store_commit(cbm_store_t *s);
 /* Rollback the current transaction. */
 int cbm_store_rollback(cbm_store_t *s);
 
+/* Read batch: run the reads that follow in one deferred read transaction,
+ * renewed every 100 ms so a writer is never held back longer, instead of one
+ * lock round trip per statement. Begin returns false (and does nothing) when
+ * a transaction is already open. For read-only work only; end it before any
+ * write, transaction or read scope on the same store. Close ends it. */
+bool cbm_store_read_batch_begin(cbm_store_t *s);
+void cbm_store_read_batch_end(cbm_store_t *s);
+/* Test seam: make an open read batch due for renewal at its next statement. */
+void cbm_store_read_batch_expire_for_test(cbm_store_t *s);
+
 /* Stable request read scope. Borrows an exclusively owned, single-thread
  * store and callback context. Refuses a transaction, busy statement or owned
  * progress handler; idle cached statements are allowed. Saves query_only and
@@ -615,6 +630,29 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
 
+/* Streamed node scan: the rows of cbm_store_find_nodes (label NULL) or
+ * cbm_store_find_nodes_by_label, in the same order, a batch at a time. Pages
+ * are keyset queries along the eager query's index, and no read lock is held
+ * between calls. open returns NULL on error. next fills out[0..max) and sets
+ * *count; a count of 0 means the scan is exhausted. The caller frees each
+ * returned node with cbm_node_free_fields. A failed read returns
+ * CBM_STORE_ERR with no rows from that call and ends the scan;
+ * cbm_store_error() names the failure. paged is false when the eager query's
+ * plan is not the one the pages reproduce: the scan then hands out the eager
+ * scan's rows (same order, no memory saving). Close the scan before closing
+ * the store. */
+typedef struct cbm_store_node_scan cbm_store_node_scan_t;
+cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *project,
+                                                const char *label);
+int cbm_store_node_scan_next(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *count);
+bool cbm_store_node_scan_paged(const cbm_store_node_scan_t *scan);
+void cbm_store_node_scan_close(cbm_store_node_scan_t *scan);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* One-shot fault: after this many successful pages (of any scan), the next
+ * page fails like a SQLite step error; -1 disables the seam. */
+void cbm_store_node_scan_test_fail_page_after(int successful_pages);
+#endif
+
 /* Return a stable, paginated outline for one exact repository-relative file.
  * File/folder/container nodes are excluded. labels may be NULL when
  * label_count is zero; otherwise labels are exact-match filters. The query is
@@ -670,11 +708,15 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
 
 /* Fetch all CALLS edges among Function/Method nodes for a project as parallel
- * (source_id, target_id) arrays (caller frees both). For SCC / cycle analysis.
+ * (source_id, target_id) arrays, released together with
+ * cbm_store_free_call_edges. For SCC / cycle analysis.
  * Stops at max_edges and sets *truncated — never a silent cap. Returns
  * CBM_STORE_OK (or _ERR); *count is the number returned. */
 int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
                                int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
+
+/* Free the (source_id, target_id) arrays returned by cbm_store_fetch_call_edges. */
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -731,7 +773,9 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
- * "oversized" = not indexed at all (detail = reason). Stored in the separate
+ * "oversized" = not indexed at all (detail = reason). "unresolved_calls" is
+ * indexed source whose invocation targets were not resolved (detail = JSON
+ * array of caller, leaf, source byte span, and reason). Stored in the separate
  * index_coverage table — coverage is metadata ABOUT the graph, never mixed
  * into the graph itself. */
 typedef struct {
@@ -740,9 +784,15 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
+/* Older generations lack precise caller attribution and resolver candidates,
+ * so their exact trace totals cannot be trusted until the project is reindexed. */
+enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 5 };
+
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
  * "unavailable"; it is deliberately separate from hash_records_complete.
+ * unresolved_calls_complete describes only unresolved invocation capture;
+ * false keeps CALLS totals conservative without voiding other coverage.
  * Strings returned by cbm_store_coverage_meta_get are heap-owned. */
 typedef struct {
     const char *project;
@@ -754,6 +804,7 @@ typedef struct {
     int ignored_files_total;
     int coverage_version;
     bool hash_records_complete;
+    bool unresolved_calls_complete;
 } cbm_coverage_meta_t;
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
@@ -782,6 +833,14 @@ int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char 
  * ancestor that covers the scope. Prefix matching is segment-boundary safe. */
 int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
                                  cbm_coverage_row_t **out, int *count);
+/* Fetch bounded unresolved invocation diagnostics for one exact caller file. */
+int cbm_store_coverage_get_unresolved_path(cbm_store_t *s, const char *project,
+                                           const char *rel_path, cbm_coverage_row_t **out,
+                                           int *count);
+/* Indexed candidate existence; truncated/malformed evidence also returns true
+ * because omitted candidates cannot prove an exact inbound total. */
+int cbm_store_coverage_has_unresolved_candidate(cbm_store_t *s, const char *project,
+                                                const char *candidate, bool *out);
 
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
@@ -805,10 +864,11 @@ int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *c
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
- * cbm_store_coverage_replace materializes the coverage rows as a file-
+ * cbm_store_coverage_replace materializes the coverage FAILURE rows as a file-
  * structure graph (Project → Folder → File{kind, detail}) under this project
  * name — queryable via the normal cypher path without touching the real
- * project's graph. */
+ * project's graph. By-design not_indexed_* rows and unresolved_calls evidence
+ * stay out of it. */
 void cbm_store_coverage_shadow_project(char *dst, size_t dstsz, const char *project);
 
 void cbm_store_free_coverage(cbm_coverage_row_t *rows, int count);
@@ -1103,6 +1163,17 @@ typedef struct {
 
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content);
 int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out);
+/* Move any legacy ADR row from the graph DB's project_summaries into the
+ * per-project sidecar, once (guarded by a marker in the sidecar). Call before a
+ * rebuild deletes the old generation, and on artifact import. Returns
+ * CBM_STORE_ERR on failure so callers can preserve the old generation. */
+int cbm_store_adr_migrate_once(cbm_store_t *s);
+/* Restore ADRs from the graph DB's project_summaries into the per-project sidecar
+ * for any project the sidecar has no row for, without overwriting a local one and
+ * regardless of the migrated marker. Used on artifact import so a teammate who
+ * already indexed the project (marked sidecar, no ADR) still receives the shared
+ * ADR the artifact carries. Returns CBM_STORE_ERR on failure. */
+int cbm_store_adr_restore_from_graph_if_absent(cbm_store_t *s);
 int cbm_store_adr_delete(cbm_store_t *s, const char *project);
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out);
@@ -1210,6 +1281,13 @@ char *cbm_glob_to_like(const char *pattern);
  * Each out[i] is malloc'd — caller must free each string. */
 int cbm_extract_like_hints(const char *pattern, char **out, int max_out);
 
+/* Literal prefix every match of an anchored POSIX ERE must begin with: the
+ * plain printable-ASCII run after a leading '^', minus its last character when
+ * a quantifier or escape follows it. Returns its length (written NUL-terminated
+ * to out); 0 when the pattern is not anchored, contains '|', or starts with an
+ * operator. Case is kept as written. */
+int cbm_regex_anchored_prefix(const char *pattern, char *out, int out_sz);
+
 /* Prepend (?i) to a regex pattern if not already present.
  * Returns a static buffer — do NOT free. */
 const char *cbm_ensure_case_insensitive(const char *pattern);
@@ -1243,13 +1321,16 @@ typedef struct {
  * reported community is internally connected. The resolution parameter
  * controls granularity (higher -> more, smaller communities); 1.0 is standard.
  * Allocates *out (length *out_count == node_count) in CBM_MEM_CLASS_OTHER;
- * the caller releases it with cbm_free(CBM_MEM_CLASS_OTHER, *out). */
+ * the caller releases it with cbm_leiden_free(*out). */
 int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                int edge_count, double resolution, cbm_louvain_result_t **out, int *out_count);
 
 /* Convenience wrapper: cbm_leiden with resolution 1.0. */
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
+
+/* Free the result array returned by cbm_leiden / cbm_louvain. */
+void cbm_leiden_free(cbm_louvain_result_t *result);
 
 /* ── Memory management helpers ──────────────────────────────────── */
 

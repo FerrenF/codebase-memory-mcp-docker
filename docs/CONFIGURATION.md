@@ -87,9 +87,10 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
-| `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
+| `auto_watch` | `true` | Global switch for MCP session watch registration. On the next refresh or registration request, `true` allows session roots and successful `index_repository` targets to be watched; `false` removes all watches. The background watcher can still run with no registered projects. |
 | `doc_candidates` | `auto` | Score documentation sections against code to store doc↔code candidates (the possible targets of a section, and the sections that may describe a function or file, each with a judged probability). Unset (`auto`), the index mode decides: on for `full` indexes (the default mode), off for `moderate` and `fast`. Set `true` or `false` to choose for every mode; `config reset doc_candidates` returns to `auto`. The scoring grows with sections × functions: under a second up to ~100k functions, ~15 s at ~400k, ~3 minutes on the Linux kernel. Off stores no candidates and leaves the rest of the graph unchanged; on in `fast` mode stores candidates without adding `fast`'s skipped `SIMILAR_TO` / `SEMANTICALLY_RELATED` edges. `index_repository` also takes `doc_candidates` for a single index, which wins over this setting. Applies from the next index. |
-| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Only an open MCP session's own project is ever watched; `index_status` reports the current state in its `watch` object. |
+| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. Active MCP sessions can register their root project and successful explicit index targets; under `daemon start` those watches outlive the session until the daemon stops, the project is deleted, its directory disappears, or `auto_watch` is set to `false`. `index_status` reports the current state in its `watch` object. |
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
@@ -102,15 +103,23 @@ has not run yet).
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
-> narrower: it only controls whether a connecting session registers *its own*
-> project with an already-running watcher. When `watcher_enabled=false`,
+> narrower: it globally controls MCP session watch registration. On the next
+> refresh or registration request, `false` removes all watches; `true` allows
+> session roots and successful explicit `index_repository` targets to register.
+> Watcher refreshes retain `mode`, `persistence`, and the resolved
+> `doc_candidates` boolean from the latest successful explicit index registered
+> for that target. This boolean can come from the request or its global setting.
+> When neither supplied a boolean, refresh uses the current setting or mode default.
+> A watcher callback also observes `auto_watch=false`: it removes all watches
+> before admitting any new refresh work.
+> When `watcher_enabled=false`,
 > `auto_watch` has no effect — there is no watcher to register with.
 >
 > They also differ in **when they are read**, which matters because the watcher
 > lives in the background daemon, not in your MCP client:
 >
-> - `auto_watch` is consulted each time a session would register its project, so
->   a change applies to sessions that connect afterwards.
+> - `auto_watch` takes effect on the next refresh or registration request and
+>   applies globally to session roots and successful `index_repository` targets.
 > - `watcher_enabled` is read **once, when the daemon starts**, because it decides
 >   whether the watcher is built at all. The daemon is long-lived and outlives
 >   individual MCP sessions, so **reconnecting your client is not enough** — retire
@@ -133,6 +142,44 @@ Equality is allowed; exceeding either setting fails the complete index request
 and preserves any previously serving database. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so each
+linked worktree becomes a separate permanent index. On machines that create many
+short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
+"index this project first" guidance) turn every throwaway checkout into another
+stored index of what is largely the same repository.
+
+Enable the key to keep those checkouts out of the index:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With it enabled:
+
+- automatic indexing skips a session whose root is a linked worktree;
+- the `hook-augment` context says the worktree is unindexed on purpose instead
+  of telling the agent to run `index_repository`;
+- an explicit `index_repository` call on a linked worktree is refused, and names
+  both ways forward — pass `index_worktree=true` for that one call, or turn the
+  key back off.
+
+The main checkout of the same repository is unaffected, as are ordinary clones
+and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
+file pointing at a gitdir that contains a `commondir` entry.
+
+A subdirectory counts as the worktree it sits in. Detection walks up from the
+given path to the nearest `.git` entry, so `index_repository` on any
+subdirectory of a linked worktree is refused the same way, and a session root or
+hook working directory inside one is treated as that worktree. The walk stops at
+the first `.git` it finds; a main checkout or a submodule ends it as "not a
+worktree". A path outside any git checkout is checked one directory at a time up
+to the filesystem root and is never treated as a worktree. None of this runs
+while the key is off.
+
+The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
 
@@ -236,6 +283,15 @@ root because they are too broad or too sensitive to index as a unit:
 - your home directory itself (directories *below* it are fine);
 - a credential directory at any depth — `.ssh`, `.aws`, `.gnupg`, `.kube`,
   `.docker`, `.netrc`, `.git-credentials`, `.password-store`, macOS `Keychains`.
+
+A single top-level directory can still be indexed as one root on purpose, for
+example a container or build machine that keeps its project in `/work`, `/app` or
+`/src`, by approving that exact path in a terminal:
+`codebase-memory-mcp allow-root --approve-broad /work`. The approval is recorded
+like any other allowed root, listed as `(approved broad)` by `allow-root --list`,
+and covers no other top-level directory; as with any recorded root, indexing is
+then confined to the recorded roots. Filesystem, drive and share roots cannot be
+approved.
 
 Two limits are worth stating plainly. This constrains *scope*, not
 *sensitivity*: inside a root that is allowed, every file the process can read may

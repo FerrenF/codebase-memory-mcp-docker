@@ -30,6 +30,7 @@
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "foundation/str_util.h"   // cbm_json_escape — variants file_path
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
+#include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
@@ -400,6 +401,31 @@ void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call) {
 void cbm_imports_push(CBMImportArray *arr, CBMArena *a, CBMImport imp) {
     GROW_ARRAY(arr, a);
     arr->items[arr->count++] = imp;
+}
+
+bool cbm_imports_local_span_binds_runtime_name(const CBMImportArray *imports, const char *name,
+                                               size_t len) {
+    if (!imports || !name) {
+        return true;
+    }
+    bool seen = false;
+    for (int i = 0; i < imports->count; i++) {
+        const CBMImport *imp = &imports->items[i];
+        if (!imp->local_name || strncmp(imp->local_name, name, len) != 0 ||
+            imp->local_name[len] != '\0') {
+            continue;
+        }
+        if (cbm_import_binds_runtime_name(imp)) {
+            return true;
+        }
+        seen = true;
+    }
+    return !seen;
+}
+
+bool cbm_imports_local_binds_runtime_name(const CBMImportArray *imports, const char *local_name) {
+    return !local_name ||
+           cbm_imports_local_span_binds_runtime_name(imports, local_name, strlen(local_name));
 }
 
 void cbm_usages_push(CBMUsageArray *arr, CBMArena *a, CBMUsage usage) {
@@ -1234,7 +1260,9 @@ static int count_params_from_signature(const char *sig) {
  * unlucky in-flight file is never quarantined alone. The env var is set
  * solely by the supervisor during recovery — a no-op on normal runs. */
 static void cbm_index_mark(const char *rel_path, char event) {
-    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
+    char marker_path[CBM_SZ_4K];
+    const char *mf =
+        cbm_safe_getenv("CBM_INDEX_MARKER_FILE", marker_path, sizeof(marker_path), NULL);
     if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
         return;
     }
@@ -1271,7 +1299,9 @@ enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
 static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
 
 static void cbm_quarantine_load(void) {
-    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
+    char quarantine_path[CBM_SZ_4K];
+    const char *qf = cbm_safe_getenv("CBM_INDEX_QUARANTINE_FILE", quarantine_path,
+                                     sizeof(quarantine_path), NULL);
     if (!qf || !qf[0]) {
         return; /* normal path: empty set */
     }
@@ -3877,6 +3907,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // OpenAPI operations as Routes (self-gated: API description documents).
     cbm_extract_openapi(&ctx);
 
+    // Next.js App Router handlers' routes (self-gated: app/**/route.ts and route.js).
+    cbm_extract_nextjs_routes(&ctx);
+
     // K8s / Kustomize semantic pass (additional structured extraction for YAML-based infra files).
     if (ctx.language == CBM_LANG_KUSTOMIZE || ctx.language == CBM_LANG_K8S) {
         cbm_extract_k8s(&ctx);
@@ -3894,7 +3927,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     uint64_t lsp_start = now_ns();
     if (!result->lsp_skipped) {
         if (language == CBM_LANG_GO) {
-            cbm_run_go_lsp(a, result, source, source_len, root);
+            cbm_run_go_lsp(a, result, source, source_len, root, rel_path);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
             if (!cbm_run_c_lsp_with_test_owners(a, result, source, source_len, root,
